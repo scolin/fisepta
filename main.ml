@@ -84,6 +84,11 @@ let s_of_edge (v1, l, v2) =
 
 module G = Graph.Imperative.Digraph.ConcreteLabeled(Vertex)(Edge)
 
+let dump_graph g =
+  G.iter_edges_e
+    (fun e -> print_endline (s_of_edge e))
+    g
+
 
 let rec get_varinfo_exp expr =
   match expr with
@@ -281,4 +286,5 @@ let _ =
   let ptrVisitor = new ptrVisitorClass in
   let () = visitCilFile (ptrVisitor:>cilVisitor) maincil in
   let g = ptrVisitor#return_graph in
+  let () = dump_graph g in
   ()
