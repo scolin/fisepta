@@ -86,7 +86,7 @@ module G = Graph.Imperative.Digraph.ConcreteLabeled(Vertex)(Edge)
 
 let dump_graph g =
   G.iter_edges_e
-    (fun e -> print_endline (s_of_edge e))
+    (fun e -> info (s_of_edge e))
     g
 
 
@@ -167,7 +167,7 @@ let rec type_of_dereferencing d =
 
 let rec build_constraints vi dereferencing =
   match dereferencing with
-  | D_irrelevant -> assert false
+  | D_irrelevant -> []
   | D_vi(vi2) -> [ (vi, Contains, vi2) ]
   | D_addr(d) ->
      begin
@@ -200,11 +200,99 @@ let get_constraints vi expr =
   build_constraints vi d
 
 
-class ptrVisitorClass =
+let string_of_varinfos vis =
+  String.concat ", " (List.map (fun v -> v.vname) vis)
+
+let string_of_expr e =
+  Pretty.sprint ~width:70 (defaultCilPrinter#pExp () e)
+
+
+let string_of_exprs exprs =
+  String.concat ", "  (List.map string_of_expr exprs)
+
+let pLoc l =
+  text l.file
+  ++ text ":"
+  ++ text (string_of_int l.line)
+
+let string_of_loc l = Pretty.sprint ~width:70 (pLoc l)
+
+
+let (seenFunctions: (string, fundec) Hashtbl.t) = Hashtbl.create 1009
+
+
+class findFunctionsClass =
+object(self)
+  inherit Cil.nopCilVisitor
+
+  method vglob g =
+    match g with
+    | GFun(fundec,_) ->
+       let () =
+         try
+           let found_vi = Hashtbl.find seenFunctions fundec.svar.vname in
+           if found_vi.svar.vid <> fundec.svar.vid
+           then
+             error ("findFunctionClass, definition: function " ^ fundec.svar.vname ^ " exists under two UIDs."
+                    ^ " This means either that there exists conflicting declarations of it"
+                    ^ " (e.g. declared twice as an inline function, or the prototype"
+                    ^ " has arguments of different types or numbers)."
+                    ^ " Please check the merge errors in the log directory.")
+         with Not_found -> Hashtbl.add seenFunctions fundec.svar.vname fundec
+       in
+       SkipChildren
+    | _ -> SkipChildren
+
+end
+
+
+let update_seenFunctions file =
+  let findFunctions = new findFunctionsClass in
+  visitCilFile findFunctions file
+
+
+class ptrVisitorClass seenFunctions =
   object(self)
   inherit Cil.nopCilVisitor
 
   val g = G.create ()
+
+
+  method vstmt s =
+    match s.skind with
+    | Instr(_) -> DoChildren
+    | Return(exp_opt, loc) ->
+       begin
+         match exp_opt with
+         | None -> SkipChildren
+         | Some(expr) ->
+            let current_fundec =
+              match !currentGlobal with
+              | GFun(f,_) -> f
+              | _ -> assert false
+            in
+            let ret_current = find_return current_fundec.svar in
+            let constraints = get_constraints ret_current expr in
+            let () =
+              List.iter
+                (fun (v1, c, v2) ->
+                  G.add_edge_e g ((vertex_of_varinfo v1), c, (vertex_of_varinfo v2))
+                )
+                constraints
+            in
+            SkipChildren
+       end
+    | Goto(_) -> DoChildren
+    | ComputedGoto(_) -> DoChildren
+    | Break(_) -> DoChildren
+    | Continue(_) -> DoChildren
+    | If(_) -> DoChildren
+    | Switch(_) -> DoChildren
+    | Loop(_) -> DoChildren
+    | Block(_) -> DoChildren
+    | TryFinally(_) -> DoChildren
+    | TryExcept(_) -> DoChildren
+
 
   method vinst i =
     match i with
@@ -234,10 +322,11 @@ class ptrVisitorClass =
                     Contains,
                     (vertex_of_varinfo ret_function ~is_return:true))
             in
-            let fundec =
-              match !currentGlobal with
-              | GFun(f, _) -> f
-              | _ -> assert false
+            let called_fundec =
+              try
+                Hashtbl.find seenFunctions vi.vname
+              with
+                Not_found -> (fatal ("Can not find a definition for " ^ vi.vname); exit 1)
             in
             let add_parameter vi expr =
               let constraints = get_constraints vi expr in
@@ -248,7 +337,14 @@ class ptrVisitorClass =
                 constraints
             in
             let () =
-              List.iter2 add_parameter fundec.sformals exprs
+              try
+                List.iter2 add_parameter called_fundec.sformals exprs
+              with
+                Invalid_argument _ ->
+                  fatal ("Not the same number of args for " ^ vi.vname ^ " at "
+                         ^ (string_of_loc loc) ^ ": "
+                         ^ (string_of_varinfos called_fundec.sformals) ^ " vs "
+                         ^ (string_of_exprs exprs))
             in
             SkipChildren
          | _ -> SkipChildren
@@ -283,7 +379,8 @@ let _ =
     if !input_file <> "" then loadBinaryFile !input_file
     else (Arg.usage spec_args usage_msg; exit 1)
   in
-  let ptrVisitor = new ptrVisitorClass in
+  let () = update_seenFunctions maincil in
+  let ptrVisitor = new ptrVisitorClass seenFunctions in
   let () = visitCilFile (ptrVisitor:>cilVisitor) maincil in
   let g = ptrVisitor#return_graph in
   let () = dump_graph g in
