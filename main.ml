@@ -356,6 +356,102 @@ class ptrVisitorClass seenFunctions =
 end
 
 
+let rule_trans witness g t1 =
+  let () = info ("rule_trans " ^ t1.name) in
+  let all_preds = G.pred g t1 in
+  let all_succs = G.succ g t1 in
+  let all_t3s = List.filter (fun t3 -> G.mem_edge_e g (t3, Contains, t1)) all_preds in
+  let all_t2s = List.filter (fun t2 -> G.mem_edge_e g (t1, Points_to, t2)) all_succs in
+  let add_t3 t2s t3 =
+    List.iter
+      (fun t2 ->
+        if not (G.mem_edge_e g (t3, Points_to, t2))
+        then begin
+          G.add_edge_e g (t3, Points_to, t2);
+          witness := true
+        end)
+      t2s
+  in
+  List.iter
+    (add_t3 all_t2s)
+    all_t3s
+
+
+let rule_deref1 witness g t2 =
+  let () = info ("rule_deref1 " ^ t2.name) in
+  let all_preds = G.pred g t2 in
+  let all_succs = G.succ g t2 in
+  let all_t1s = List.filter (fun t1 -> G.mem_edge_e g (t1, Contains_star, t2)) all_preds in
+  let all_t3s = List.filter (fun t3 -> G.mem_edge_e g (t2, Points_to, t3)) all_succs in
+  let add_t3 t1s t3 =
+    List.iter
+      (fun t1 ->
+        if not (G.mem_edge_e g (t1, Points_to, t3))
+        then begin
+          G.add_edge_e g (t1, Points_to, t3);
+          witness := true
+        end)
+      t1s
+  in
+  List.iter
+    (add_t3 all_t1s)
+    all_t3s
+
+
+let rule_deref2 witness g t1 =
+  let () = info ("rule_deref2 " ^ t1.name) in
+  let all_succs = G.succ g t1 in
+  let all_t2s = List.filter (fun t2 -> G.mem_edge_e g (t1, Star_contains, t2)) all_succs in
+  let all_t3s = List.filter (fun t3 -> G.mem_edge_e g (t1, Points_to, t3)) all_succs in
+  let add_t3 t2s t3 =
+    List.iter
+      (fun t2 ->
+        if not (G.mem_edge_e g (t3, Points_to, t2))
+        then begin
+          G.add_edge_e g (t3, Points_to, t2);
+          witness := true
+        end)
+      t2s
+  in
+  List.iter
+    (add_t3 all_t2s)
+    all_t3s
+
+
+let rule_deref3 witness g t1 =
+  let () = info ("rule_deref3 " ^ t1.name) in
+  let all_succs = G.succ g t1 in
+  let all_t2s = List.filter (fun t2 -> G.mem_edge_e g (t1, Star_points_to, t2)) all_succs in
+  let all_t3s = List.filter (fun t3 -> G.mem_edge_e g (t1, Points_to, t3)) all_succs in
+  let add_t3 t2s t3 =
+    List.iter
+      (fun t2 ->
+        if not (G.mem_edge_e g (t3, Contains, t2))
+        then begin
+          G.add_edge_e g (t3, Contains, t2);
+          witness := true
+        end)
+      t2s
+  in
+  List.iter
+    (add_t3 all_t2s)
+    all_t3s
+
+
+let compute_constraints g =
+  let has_changed = ref false in
+  let rec steps () =
+    begin
+      G.iter_vertex (fun v -> rule_trans has_changed g v) g;
+      G.iter_vertex (fun v -> rule_deref1 has_changed g v) g;
+      G.iter_vertex (fun v -> rule_deref2 has_changed g v) g;
+      G.iter_vertex (fun v -> rule_deref3 has_changed g v) g;
+      if !has_changed then (has_changed := false; steps ())
+    end
+  in
+  steps ()
+
+
 let usage_msg =
   ( "usage : " ^ (Filename.basename Sys.executable_name) ^ " file.cil\n" )
 
@@ -383,5 +479,9 @@ let _ =
   let ptrVisitor = new ptrVisitorClass seenFunctions in
   let () = visitCilFile (ptrVisitor:>cilVisitor) maincil in
   let g = ptrVisitor#return_graph in
+  let () = dump_graph g in
+  let () = info "***** BEGIN: computing constraints *****" in
+  let () = compute_constraints g in
+  let () = info "***** END: computing constraints *****" in
   let () = dump_graph g in
   ()
