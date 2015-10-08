@@ -357,7 +357,7 @@ end
 
 
 let rule_trans witness g t1 =
-  let () = info ("rule_trans " ^ t1.name) in
+  let rule_prefix = "rule_trans " ^ t1.name in
   let all_preds = G.pred g t1 in
   let all_succs = G.succ g t1 in
   let all_t3s = List.filter (fun t3 -> G.mem_edge_e g (t3, Contains, t1)) all_preds in
@@ -367,7 +367,13 @@ let rule_trans witness g t1 =
       (fun t2 ->
         if not (G.mem_edge_e g (t3, Points_to, t2))
         then begin
-          G.add_edge_e g (t3, Points_to, t2);
+          let hyp1 = s_of_edge (t3, Contains, t1) in
+          let hyp2 = s_of_edge (t1, Points_to, t2) in
+          let new_edge = (t3, Points_to, t2) in
+          let res = s_of_edge new_edge in
+          let addition = rule_prefix ^ ": [" ^ hyp1 ^ "]  +  [" ^ hyp2 ^ "]  =  [" ^ res ^ "]" in
+          G.add_edge_e g new_edge;
+          info addition;
           witness := true
         end)
       t2s
@@ -378,7 +384,7 @@ let rule_trans witness g t1 =
 
 
 let rule_deref1 witness g t2 =
-  let () = info ("rule_deref1 " ^ t2.name) in
+  let rule_prefix = "rule_deref1 " ^ t2.name in
   let all_preds = G.pred g t2 in
   let all_succs = G.succ g t2 in
   let all_t1s = List.filter (fun t1 -> G.mem_edge_e g (t1, Contains_star, t2)) all_preds in
@@ -386,9 +392,15 @@ let rule_deref1 witness g t2 =
   let add_t3 t1s t3 =
     List.iter
       (fun t1 ->
-        if not (G.mem_edge_e g (t1, Points_to, t3))
+        if not (G.mem_edge_e g (t1, Contains, t3))
         then begin
-          G.add_edge_e g (t1, Points_to, t3);
+          let hyp1 = s_of_edge (t1, Contains_star, t2) in
+          let hyp2 = s_of_edge (t2, Points_to, t3) in
+          let new_edge = (t1, Contains, t3) in
+          let res = s_of_edge new_edge in
+          let addition = rule_prefix ^ ": [" ^ hyp1 ^ "]  +  [" ^ hyp2 ^ "]  =  [" ^ res ^ "]" in
+          G.add_edge_e g new_edge;
+          info addition;
           witness := true
         end)
       t1s
@@ -399,7 +411,7 @@ let rule_deref1 witness g t2 =
 
 
 let rule_deref2 witness g t1 =
-  let () = info ("rule_deref2 " ^ t1.name) in
+  let rule_prefix = "rule_deref2 " ^ t1.name in
   let all_succs = G.succ g t1 in
   let all_t2s = List.filter (fun t2 -> G.mem_edge_e g (t1, Star_contains, t2)) all_succs in
   let all_t3s = List.filter (fun t3 -> G.mem_edge_e g (t1, Points_to, t3)) all_succs in
@@ -408,7 +420,13 @@ let rule_deref2 witness g t1 =
       (fun t2 ->
         if not (G.mem_edge_e g (t3, Points_to, t2))
         then begin
-          G.add_edge_e g (t3, Points_to, t2);
+          let hyp1 = s_of_edge (t1, Star_contains, t2) in
+          let hyp2 = s_of_edge (t1, Points_to, t3) in
+          let new_edge = (t3, Contains, t2) in
+          let res = s_of_edge new_edge in
+          let addition = rule_prefix ^ ": [" ^ hyp1 ^ "]  +  [" ^ hyp2 ^ "]  =  [" ^ res ^ "]" in
+          G.add_edge_e g new_edge;
+          info addition;
           witness := true
         end)
       t2s
@@ -419,7 +437,7 @@ let rule_deref2 witness g t1 =
 
 
 let rule_deref3 witness g t1 =
-  let () = info ("rule_deref3 " ^ t1.name) in
+  let rule_prefix = "rule_deref3 " ^ t1.name in
   let all_succs = G.succ g t1 in
   let all_t2s = List.filter (fun t2 -> G.mem_edge_e g (t1, Star_points_to, t2)) all_succs in
   let all_t3s = List.filter (fun t3 -> G.mem_edge_e g (t1, Points_to, t3)) all_succs in
@@ -428,7 +446,13 @@ let rule_deref3 witness g t1 =
       (fun t2 ->
         if not (G.mem_edge_e g (t3, Contains, t2))
         then begin
-          G.add_edge_e g (t3, Contains, t2);
+          let hyp1 = s_of_edge (t1, Star_points_to, t2) in
+          let hyp2 = s_of_edge (t1, Points_to, t3) in
+          let new_edge = (t3, Points_to, t2) in
+          let res = s_of_edge new_edge in
+          let addition = rule_prefix ^ ": [" ^ hyp1 ^ "]  +  [" ^ hyp2 ^ "]  =  [" ^ res ^ "]" in
+          G.add_edge_e g new_edge;
+          info addition;
           witness := true
         end)
       t2s
