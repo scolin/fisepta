@@ -58,7 +58,6 @@ type edge_constraint =
   | Points_to
   | Contains_star
   | Star_contains
-  | Star_points_to
 
 module Edge = struct
    type t = edge_constraint
@@ -77,7 +76,6 @@ let s_of_edge (v1, l, v2) =
     | Points_to -> (no_change, set_of)
     | Contains_star -> (no_change, star)
     | Star_contains -> (star, no_change)
-    | Star_points_to -> (star, set_of)
   in
   (left_s (s_of_vertex v1)) ^ " > " ^ (right_s (s_of_vertex v2))
 
@@ -120,6 +118,14 @@ type dereferencing =
   | D_vi of varinfo
   | D_addr of dereferencing
   | D_mem of dereferencing
+
+
+let rec string_of_dereferencing d =
+  match d with
+  | D_irrelevant -> "_"
+  | D_vi(vi) -> vi.vname ^ "[" ^ (string_of_int vi.vid) ^ "]"
+  | D_addr(e) -> "&" ^ (string_of_dereferencing e)
+  | D_mem(e) -> "*" ^ (string_of_dereferencing e)
 
 
 let rec is_irrelevant = function
@@ -165,39 +171,79 @@ let rec type_of_dereferencing d =
      | _ -> invalid_arg "type_of_dereferencing"
 
 
-let rec build_constraints vi dereferencing =
-  match dereferencing with
-  | D_irrelevant -> []
-  | D_vi(vi2) -> [ (vi, Contains, vi2) ]
-  | D_addr(d) ->
-     begin
-       match d with
-       | D_irrelevant -> assert false
-       | D_vi(vi2) -> [ (vi, Points_to, vi2) ]
-       | _ -> (* more complex, we have to introduce a temporary variable *)
-          let type_of_d = type_of_dereferencing d in
-          let tmp_var = makeVarinfo false vi.vname type_of_d in
-          let () = tmp_var.vname <- vi.vname ^ "_" ^ (string_of_int tmp_var.vid) in
-          let sub_constraints = build_constraints tmp_var d in
-          (vi, Points_to, tmp_var) :: sub_constraints
-     end
-  | D_mem(d) ->
-     begin
-       match d with
-       | D_irrelevant -> assert false
-       | D_vi(vi2) -> [ (vi, Contains_star, vi2) ]
-       | _ -> (* more complex, we have to introduce a temporary variable *)
-          let type_of_d = type_of_dereferencing d in
-          let tmp_var = makeVarinfo false vi.vname type_of_d in
-          let () = tmp_var.vname <- vi.vname ^ "_" ^ (string_of_int tmp_var.vid) in
-          let sub_constraints = build_constraints tmp_var d in
-          (vi, Contains_star, tmp_var) :: sub_constraints
-     end
+let string_of_constraint left right =
+  (string_of_dereferencing left)
+  ^ " = "
+  ^ (string_of_dereferencing right)
+
+let rec build_constraints left right =
+  match (left, right) with
+  | D_irrelevant, _ -> assert false
+  | _, D_irrelevant -> []
+  | D_vi(vi1), D_vi(vi2) -> [ (vi1, Contains, vi2) ]
+  | D_vi(vi1), D_addr(D_vi(vi2)) -> [ (vi1, Points_to, vi2) ]
+  | D_vi(vi1), D_mem(D_vi(vi2)) -> [ (vi1, Contains_star, vi2) ]
+  | D_vi(vi1), _ ->
+     build_constraints_right vi1 right
+  | D_mem(D_vi(vi1)), D_vi(vi2) -> [ (vi1, Star_contains, vi2) ]
+  | D_mem(_), D_vi(vi2) ->
+     build_constraints_left left vi2
+  | D_addr(_), _ -> assert false
+  | _, _ ->
+     let type_of_d = type_of_dereferencing right in
+     let tmp_var = makeVarinfo false "tmp_" type_of_d in
+     let () = tmp_var.vname <- "tmp_" ^ (string_of_int tmp_var.vid) in
+     let () = info (
+       "Transforming " ^ (string_of_constraint left right)
+       ^ " into " ^ (string_of_constraint left (D_vi(tmp_var)))
+       ^ " and " ^ (string_of_constraint (D_vi(tmp_var)) right))
+     in
+     let sub_constraints_left = build_constraints left (D_vi(tmp_var)) in
+     let sub_constraints_right = build_constraints (D_vi(tmp_var)) right in
+     sub_constraints_left @ sub_constraints_right
+and build_constraints_right vi right =
+  match right with
+  | D_irrelevant
+  | D_vi(_)
+  | D_mem(D_vi(_))
+  | D_addr(D_vi(_)) -> assert false
+  | D_mem(x) ->
+     let type_of_x = type_of_dereferencing x in
+     let tmp_var = makeVarinfo false vi.vname type_of_x in
+     let () = tmp_var.vname <- vi.vname ^ "_" ^ (string_of_int tmp_var.vid) in
+     let () = info (
+       "Transforming " ^ (string_of_constraint (D_vi(vi)) right)
+       ^ " into " ^ (string_of_constraint (D_vi(vi)) (D_mem(D_vi(tmp_var))))
+       ^ " and " ^ (string_of_constraint (D_vi(tmp_var)) x))
+     in
+     let sub_constraints_left = build_constraints (D_vi(vi)) (D_mem(D_vi(tmp_var))) in
+     let sub_constraints_right = build_constraints (D_vi(tmp_var)) x in
+     sub_constraints_left @ sub_constraints_right
+  | D_addr(x) -> assert false
+and build_constraints_left left vi =
+  match left with
+  | D_irrelevant
+  | D_vi(_)
+  | D_addr(_)
+  | D_mem(D_vi(_)) -> assert false
+  | D_mem(x) ->
+     let type_of_x = type_of_dereferencing x in
+     let tmp_var = makeVarinfo false vi.vname type_of_x in
+     let () = tmp_var.vname <- vi.vname ^ "_" ^ (string_of_int tmp_var.vid) in
+     let () = info (
+       "Transforming " ^ (string_of_constraint left (D_vi(vi)))
+       ^ " into " ^ (string_of_constraint (D_mem(D_vi(tmp_var))) (D_vi(vi)))
+       ^ " and " ^ (string_of_constraint (D_vi(tmp_var)) x))
+     in
+     let sub_constraints_left = build_constraints (D_mem(D_vi(tmp_var))) (D_vi(vi)) in
+     let sub_constraints_right = build_constraints (D_vi(tmp_var)) x in
+     sub_constraints_left @ sub_constraints_right
 
 
-let get_constraints vi expr =
-  let d = build_dereferencing_expr expr in
-  build_constraints vi d
+let get_constraints lval expr =
+  let l = build_dereferencing_lval lval in
+  let e = build_dereferencing_expr expr in
+  build_constraints l e
 
 
 let string_of_varinfos vis =
@@ -272,7 +318,7 @@ class ptrVisitorClass seenFunctions =
               | _ -> assert false
             in
             let ret_current = find_return current_fundec.svar in
-            let constraints = get_constraints ret_current expr in
+            let constraints = get_constraints (Var(ret_current),NoOffset) expr in
             let () =
               List.iter
                 (fun (v1, c, v2) ->
@@ -297,8 +343,7 @@ class ptrVisitorClass seenFunctions =
   method vinst i =
     match i with
     | Set(lval, exp, loc) ->
-       let vi = get_varinfo_lval lval in
-       let constraints = get_constraints vi exp in
+       let constraints = get_constraints lval exp in
        let () =
          List.iter
            (fun (v1, c, v2) ->
@@ -329,7 +374,7 @@ class ptrVisitorClass seenFunctions =
                 Not_found -> (fatal ("Can not find a definition for " ^ vi.vname); exit 1)
             in
             let add_parameter vi expr =
-              let constraints = get_constraints vi expr in
+              let constraints = get_constraints (Var(vi),NoOffset) expr in
               List.iter
                 (fun (v1, c, v2) ->
                   G.add_edge_e g ((vertex_of_varinfo v1), c, (vertex_of_varinfo v2))
@@ -418,7 +463,7 @@ let rule_deref2 witness g t1 =
   let add_t3 t2s t3 =
     List.iter
       (fun t2 ->
-        if not (G.mem_edge_e g (t3, Points_to, t2))
+        if not (G.mem_edge_e g (t3, Contains, t2))
         then begin
           let hyp1 = s_of_edge (t1, Star_contains, t2) in
           let hyp2 = s_of_edge (t1, Points_to, t3) in
@@ -436,31 +481,6 @@ let rule_deref2 witness g t1 =
     all_t3s
 
 
-let rule_deref3 witness g t1 =
-  let rule_prefix = "rule_deref3 " ^ t1.name in
-  let all_succs = G.succ g t1 in
-  let all_t2s = List.filter (fun t2 -> G.mem_edge_e g (t1, Star_points_to, t2)) all_succs in
-  let all_t3s = List.filter (fun t3 -> G.mem_edge_e g (t1, Points_to, t3)) all_succs in
-  let add_t3 t2s t3 =
-    List.iter
-      (fun t2 ->
-        if not (G.mem_edge_e g (t3, Contains, t2))
-        then begin
-          let hyp1 = s_of_edge (t1, Star_points_to, t2) in
-          let hyp2 = s_of_edge (t1, Points_to, t3) in
-          let new_edge = (t3, Points_to, t2) in
-          let res = s_of_edge new_edge in
-          let addition = rule_prefix ^ ": [" ^ hyp1 ^ "]  +  [" ^ hyp2 ^ "]  =  [" ^ res ^ "]" in
-          G.add_edge_e g new_edge;
-          info addition;
-          witness := true
-        end)
-      t2s
-  in
-  List.iter
-    (add_t3 all_t2s)
-    all_t3s
-
 
 let compute_constraints g =
   let has_changed = ref false in
@@ -469,7 +489,6 @@ let compute_constraints g =
       G.iter_vertex (fun v -> rule_trans has_changed g v) g;
       G.iter_vertex (fun v -> rule_deref1 has_changed g v) g;
       G.iter_vertex (fun v -> rule_deref2 has_changed g v) g;
-      G.iter_vertex (fun v -> rule_deref3 has_changed g v) g;
       if !has_changed then (has_changed := false; steps ())
     end
   in
