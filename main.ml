@@ -15,6 +15,43 @@ let error s = prerr_endline ("[error] " ^ s)
 let fatal s = prerr_endline ("[fatal] " ^ s)
 
 
+
+
+
+
+let (seenFunctions: (string, fundec) Hashtbl.t) = Hashtbl.create 1009
+
+
+class findFunctionsClass =
+object(self)
+  inherit Cil.nopCilVisitor
+
+  method vglob g =
+    match g with
+    | GFun(fundec,_) ->
+       let () =
+         try
+           let found_vi = Hashtbl.find seenFunctions fundec.svar.vname in
+           if found_vi.svar.vid <> fundec.svar.vid
+           then
+             error ("findFunctionClass, definition: function " ^ fundec.svar.vname ^ " exists under two UIDs."
+                    ^ " This means either that there exists conflicting declarations of it"
+                    ^ " (e.g. declared twice as an inline function, or the prototype"
+                    ^ " has arguments of different types or numbers)."
+                    ^ " Please check the merge errors in the log directory.")
+         with Not_found -> Hashtbl.add seenFunctions fundec.svar.vname fundec
+       in
+       SkipChildren
+    | _ -> SkipChildren
+
+end
+
+
+let update_seenFunctions file =
+  let findFunctions = new findFunctionsClass in
+  visitCilFile findFunctions file
+
+
 let function_returns = Hashtbl.create 223
 
 let find_return f_svar =
@@ -30,6 +67,108 @@ let find_return f_svar =
       let new_var = makeGlobalVar ("return_" ^ f_svar.vname) return_type in
       let () = Hashtbl.add function_returns f_svar.vid new_var in
       new_var
+
+
+let string_of_varinfos vis =
+  String.concat ", " (List.map (fun v -> v.vname) vis)
+
+let string_of_expr e =
+  Pretty.sprint ~width:70 (defaultCilPrinter#pExp () e)
+
+
+let string_of_exprs exprs =
+  String.concat ", "  (List.map string_of_expr exprs)
+
+let pLoc l =
+  text l.file
+  ++ text ":"
+  ++ text (string_of_int l.line)
+
+let string_of_loc l = Pretty.sprint ~width:70 (pLoc l)
+
+class ptrVisitorClass seenFunctions =
+  object(self)
+  inherit Cil.nopCilVisitor
+
+  val relationships = ref []
+
+
+  method vstmt s =
+    match s.skind with
+    | Instr(_) -> DoChildren
+    | Return(exp_opt, loc) ->
+       begin
+         match exp_opt with
+         | None -> SkipChildren
+         | Some(expr) ->
+            let current_fundec =
+              match !currentGlobal with
+              | GFun(f,_) -> f
+              | _ -> assert false
+            in
+            let ret_current = find_return current_fundec.svar in
+            begin
+              relationships := ((Var(ret_current),NoOffset), expr) :: !relationships;
+              SkipChildren
+            end
+       end
+    | Goto(_) -> DoChildren
+    | ComputedGoto(_) -> DoChildren
+    | Break(_) -> DoChildren
+    | Continue(_) -> DoChildren
+    | If(_) -> DoChildren
+    | Switch(_) -> DoChildren
+    | Loop(_) -> DoChildren
+    | Block(_) -> DoChildren
+    | TryFinally(_) -> DoChildren
+    | TryExcept(_) -> DoChildren
+
+
+  method vinst i =
+    match i with
+    | Set(lval, exp, loc) ->
+       begin
+         relationships := (lval, exp) :: !relationships;
+         SkipChildren
+       end
+    | Call(lval_opt, exp, exprs, loc) ->
+       begin
+         match exp with
+         | Lval(Var(vi), NoOffset) -> (* direct call *)
+            let () =
+              match lval_opt with
+              | None -> ()
+              | Some(ret) ->
+                 relationships := (ret, Lval(Var(find_return vi), NoOffset)) :: !relationships
+            in
+            let called_fundec =
+              try
+                Hashtbl.find seenFunctions vi.vname
+              with
+                Not_found -> (fatal ("Can not find a definition for " ^ vi.vname); exit 1)
+            in
+            let add_parameter vi expr =
+              relationships := ((Var(vi), NoOffset), expr) :: !relationships
+            in
+            let () =
+              try
+                List.iter2 add_parameter called_fundec.sformals exprs
+              with
+                Invalid_argument _ ->
+                  fatal ("Not the same number of args for " ^ vi.vname ^ " at "
+                         ^ (string_of_loc loc) ^ ": "
+                         ^ (string_of_varinfos called_fundec.sformals) ^ " vs "
+                         ^ (string_of_exprs exprs))
+            in
+            SkipChildren
+         | _ -> SkipChildren
+       end
+    | Asm(_) -> SkipChildren
+
+  method return_relationships = !relationships
+
+end
+
 
 
 type vertex = {
@@ -246,159 +385,18 @@ let get_constraints lval expr =
   build_constraints l e
 
 
-let string_of_varinfos vis =
-  String.concat ", " (List.map (fun v -> v.vname) vis)
-
-let string_of_expr e =
-  Pretty.sprint ~width:70 (defaultCilPrinter#pExp () e)
-
-
-let string_of_exprs exprs =
-  String.concat ", "  (List.map string_of_expr exprs)
-
-let pLoc l =
-  text l.file
-  ++ text ":"
-  ++ text (string_of_int l.line)
-
-let string_of_loc l = Pretty.sprint ~width:70 (pLoc l)
-
-
-let (seenFunctions: (string, fundec) Hashtbl.t) = Hashtbl.create 1009
-
-
-class findFunctionsClass =
-object(self)
-  inherit Cil.nopCilVisitor
-
-  method vglob g =
-    match g with
-    | GFun(fundec,_) ->
-       let () =
-         try
-           let found_vi = Hashtbl.find seenFunctions fundec.svar.vname in
-           if found_vi.svar.vid <> fundec.svar.vid
-           then
-             error ("findFunctionClass, definition: function " ^ fundec.svar.vname ^ " exists under two UIDs."
-                    ^ " This means either that there exists conflicting declarations of it"
-                    ^ " (e.g. declared twice as an inline function, or the prototype"
-                    ^ " has arguments of different types or numbers)."
-                    ^ " Please check the merge errors in the log directory.")
-         with Not_found -> Hashtbl.add seenFunctions fundec.svar.vname fundec
-       in
-       SkipChildren
-    | _ -> SkipChildren
-
-end
-
-
-let update_seenFunctions file =
-  let findFunctions = new findFunctionsClass in
-  visitCilFile findFunctions file
-
-
-class ptrVisitorClass seenFunctions =
-  object(self)
-  inherit Cil.nopCilVisitor
-
-  val g = G.create ()
-
-
-  method vstmt s =
-    match s.skind with
-    | Instr(_) -> DoChildren
-    | Return(exp_opt, loc) ->
-       begin
-         match exp_opt with
-         | None -> SkipChildren
-         | Some(expr) ->
-            let current_fundec =
-              match !currentGlobal with
-              | GFun(f,_) -> f
-              | _ -> assert false
-            in
-            let ret_current = find_return current_fundec.svar in
-            let constraints = get_constraints (Var(ret_current),NoOffset) expr in
-            let () =
-              List.iter
-                (fun (v1, c, v2) ->
-                  G.add_edge_e g ((vertex_of_varinfo v1), c, (vertex_of_varinfo v2))
-                )
-                constraints
-            in
-            SkipChildren
-       end
-    | Goto(_) -> DoChildren
-    | ComputedGoto(_) -> DoChildren
-    | Break(_) -> DoChildren
-    | Continue(_) -> DoChildren
-    | If(_) -> DoChildren
-    | Switch(_) -> DoChildren
-    | Loop(_) -> DoChildren
-    | Block(_) -> DoChildren
-    | TryFinally(_) -> DoChildren
-    | TryExcept(_) -> DoChildren
-
-
-  method vinst i =
-    match i with
-    | Set(lval, exp, loc) ->
-       let constraints = get_constraints lval exp in
-       let () =
-         List.iter
-           (fun (v1, c, v2) ->
-             G.add_edge_e g ((vertex_of_varinfo v1), c, (vertex_of_varinfo v2))
-           )
-           constraints
-       in
-       SkipChildren
-    | Call(lval_opt, exp, exprs, loc) ->
-       begin
-         match exp with
-         | Lval(Var(vi), NoOffset) -> (* direct call *)
-            let () =
-              match lval_opt with
-              | None -> ()
-              | Some(ret) ->
-                 let ret_vi = get_varinfo_lval ret in
-                 let ret_function = find_return vi in
-                 G.add_edge_e g
-                   ((vertex_of_varinfo ret_vi),
-                    Contains,
-                    (vertex_of_varinfo ret_function ~is_return:true))
-            in
-            let called_fundec =
-              try
-                Hashtbl.find seenFunctions vi.vname
-              with
-                Not_found -> (fatal ("Can not find a definition for " ^ vi.vname); exit 1)
-            in
-            let add_parameter vi expr =
-              let constraints = get_constraints (Var(vi),NoOffset) expr in
-              List.iter
-                (fun (v1, c, v2) ->
-                  G.add_edge_e g ((vertex_of_varinfo v1), c, (vertex_of_varinfo v2))
-                )
-                constraints
-            in
-            let () =
-              try
-                List.iter2 add_parameter called_fundec.sformals exprs
-              with
-                Invalid_argument _ ->
-                  fatal ("Not the same number of args for " ^ vi.vname ^ " at "
-                         ^ (string_of_loc loc) ^ ": "
-                         ^ (string_of_varinfos called_fundec.sformals) ^ " vs "
-                         ^ (string_of_exprs exprs))
-            in
-            SkipChildren
-         | _ -> SkipChildren
-       end
-    | Asm(_) -> SkipChildren
-
-  method return_graph = g
-
-end
+let graph_of_relationships relationships =
+  let g = G.create () in
+  let add_relationship (lval, expr) =
+    let constraints = get_constraints lval expr in
+    List.iter
+      (fun (v1, c, v2) ->
+        G.add_edge_e g ((vertex_of_varinfo v1), c, (vertex_of_varinfo v2))
+      )
+      constraints
+  in
+  let () = List.iter add_relationship relationships in
+  g
 
 
 let rule_trans witness g t1 =
@@ -521,7 +519,8 @@ let _ =
   let () = update_seenFunctions maincil in
   let ptrVisitor = new ptrVisitorClass seenFunctions in
   let () = visitCilFile (ptrVisitor:>cilVisitor) maincil in
-  let g = ptrVisitor#return_graph in
+  let relationships = ptrVisitor#return_relationships in
+  let g = graph_of_relationships relationships in
   let () = dump_graph g in
   let () = info "***** BEGIN: computing constraints *****" in
   let () = compute_constraints g in
