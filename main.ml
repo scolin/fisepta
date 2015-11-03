@@ -86,7 +86,7 @@ let pLoc l =
 
 let string_of_loc l = Pretty.sprint ~width:70 (pLoc l)
 
-class ptrVisitorClass seenFunctions =
+class constraintVisitorClass seenFunctions =
   object(self)
   inherit Cil.nopCilVisitor
 
@@ -517,9 +517,9 @@ let _ =
     else (Arg.usage spec_args usage_msg; exit 1)
   in
   let () = update_seenFunctions maincil in
-  let ptrVisitor = new ptrVisitorClass seenFunctions in
-  let () = visitCilFile (ptrVisitor:>cilVisitor) maincil in
-  let relationships = ptrVisitor#return_relationships in
+  let constraintVisitor = new constraintVisitorClass seenFunctions in
+  let () = visitCilFile (constraintVisitor:>cilVisitor) maincil in
+  let relationships = constraintVisitor#return_relationships in
   let g = graph_of_relationships relationships in
   let () = dump_graph g in
   let () = info "***** BEGIN: computing constraints *****" in
