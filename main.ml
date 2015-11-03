@@ -482,12 +482,14 @@ let rule_deref2 witness g t1 =
 
 let compute_constraints g =
   let has_changed = ref false in
+  let i = ref 1 in
   let rec steps () =
     begin
+      let () = info ("Pass " ^ (string_of_int !i)) in
       G.iter_vertex (fun v -> rule_trans has_changed g v) g;
       G.iter_vertex (fun v -> rule_deref1 has_changed g v) g;
       G.iter_vertex (fun v -> rule_deref2 has_changed g v) g;
-      if !has_changed then (has_changed := false; steps ())
+      if !has_changed then (has_changed := false; incr i; steps ())
     end
   in
   steps ()
