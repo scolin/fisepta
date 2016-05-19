@@ -59,15 +59,149 @@ type var_category =
   | LocalVar of varinfo * fundec
   | GlobalVar of varinfo
 
-type fieldable = var_category * field
-and field =
-  | NoField
-  | Field of string * field
-
 type refinfo =
   | RealVariable of var_category
   | TempVariable of varinfo
   | ReturnVar of varinfo (* not a fundec, for functions that have no body *)
+
+
+let type_of_refinfo r =
+  match r with
+  | RealVariable(FormalVar(s,i,f)) ->
+     begin
+       match unrollType f.vtype with
+       | TFun(_,args_opt,_,_) ->
+          begin
+            try
+              let args = argsToList args_opt in
+              let (_,t,_) = List.nth args i in
+              t
+            with
+              Failure _ ->
+                invalid_arg ("type_of_refinfo: not enough arguments in " ^ f.vname)
+            | Invalid_argument _ ->
+               invalid_arg ("type_of_refinfo: negative argument in " ^ f.vname)
+          end
+       | _ -> invalid_arg ("type_of_refinfo: type of argument of " ^ f.vname)
+     end
+  | RealVariable(LocalVar(v,f)) -> v.vtype
+  | RealVariable(GlobalVar(v)) -> v.vtype
+  | TempVariable(v) -> v.vtype
+  | ReturnVar(f) ->
+     match unrollType f.vtype with
+     | TFun(rtype,_,_,_) -> rtype
+     | _ -> invalid_arg ("type_of_refinfo: ReturnVar: " ^ f.vname ^ " not a function")
+
+
+type fieldable = refinfo * field
+and field =
+  | NoField
+  | Field of string * field
+
+let string_of_field f =
+  let rec sub_field g =
+    match g with
+    | NoField -> assert false
+    | Field(s,NoField) -> "." ^ s
+    | Field(s,h) -> "." ^ s ^ (sub_field h)
+  in
+  match f with
+  | NoField -> ""
+  | _ -> sub_field f
+
+
+let get_field_index ci f =
+  let rec gfi i fis =
+    match fis with
+    | [] -> raise Not_found
+    | fi::tl ->
+       if fi.fname = f then i else gfi (i+1) tl
+  in
+  gfi 0 ci.cfields
+
+
+let rec number_sub_fields t =
+  match unrollType t with
+  | TNamed(_) -> assert false
+  | TVoid(_) | TInt(_) | TFloat(_) | TPtr(_) | TFun(_) | TEnum(_) | TBuiltin_va_list(_) -> 1
+  | TArray(u,_,_) -> number_sub_fields u
+  | TComp(ci,_) ->
+     List.fold_left
+       (fun sum fi ->
+	 if fi.fname = missingFieldName then sum
+	 else sum + (number_sub_fields fi.ftype))
+       0
+       ci.cfields
+
+let rec get_offset_number typ offset =
+  match offset with
+  | NoOffset -> 0
+  | Field(fi,ofs) ->
+     begin
+       match unrollType typ with
+       | TComp(ci, _) ->
+	  let rec loop acc rem_fields =
+	    match rem_fields with
+	    | [] -> raise Not_found
+	    | hd::tl ->
+	       if hd.fname = fi.fname
+	       then acc + (get_offset_number hd.ftype ofs)
+	       else loop (acc + (number_sub_fields hd.ftype)) tl
+	  in
+	  loop 0 ci.cfields
+       | _ -> invalid_arg "get_offset_number: not a structure/union"
+     end
+  | Index(_,ofs) ->
+     begin
+       match unrollType typ with
+       | TArray(t,_,_) -> get_offset_number t ofs
+       | _ -> invalid_arg "get_offset_number: not an array"
+     end
+
+
+let rec get_field_number typ field =
+  match field with
+  | NoField -> 0
+  | Field(s,sub_field) ->
+     match unrollType typ with
+     | TComp(ci, _) ->
+	let rec loop acc rem_fields =
+	  match rem_fields with
+	  | [] -> raise Not_found
+	  | hd::tl ->
+	     if hd.fname = s
+	     then acc + (get_field_number hd.ftype sub_field)
+	     else loop (acc + (number_sub_fields hd.ftype)) tl
+	in
+	loop 0 ci.cfields
+     | _ -> invalid_arg "get_offset_field: not a structure/union"
+
+
+let rec flatten_type t =
+  match unrollType t with
+  | TComp(ci,_) -> flatten_fields ci
+  | _ -> [ NoField ]
+and flatten_fields ci =
+  List.concat (List.map expand_field ci.cfields)
+and expand_field fi = List.map (fun x -> Field(fi.fname, x)) (flatten_type fi.ftype)
+
+let rec type_of_field typ field =
+  match field with
+  | NoField -> typ
+  | Field(s, sub_field) ->
+     match unrollType typ with
+     | TComp(ci, _) ->
+	let rec loop rem_fields =
+	  match rem_fields with
+	  | [] -> raise Not_found
+	  | hd::tl ->
+	     if hd.fname = s
+	     then type_of_field hd.ftype sub_field
+	     else loop  tl
+	in
+	loop ci.cfields
+     | _ -> invalid_arg "type_of_field: not a structure/union"
+
 
 
 let string_of_var_category v =
@@ -81,6 +215,10 @@ let string_of_refinfo r =
   | RealVariable(v) -> string_of_var_category v
   | TempVariable(v) -> v.vname ^ "(temporary)"
   | ReturnVar(f) -> "return of " ^ f.vname
+
+let string_of_fieldable (r,f) =
+  (string_of_refinfo r) ^ (string_of_field f)
+
 
 module RefinfoCompare =
 struct
@@ -106,6 +244,16 @@ struct
 
 end
 module RefinfoMap = Map.Make(RefinfoCompare)
+
+module FieldableCompare =
+  struct
+    type t = fieldable
+    let compare (r1,f1) (r2,f2) =
+      let cmp_r = RefinfoCompare.compare r1 r2 in
+      if cmp_r = 0 then compare f1 f2 else cmp_r
+  end
+module FieldableMap = Map.Make(FieldableCompare)
+
 module PureIdCompare =
 struct
   type t = int
@@ -115,56 +263,44 @@ module PureIdMap = Map.Make(PureIdCompare)
 (* We start at 1, so that 0 or <0 can be considered an error *)
 let uid = ref 1
 
-let ids_of = ref RefinfoMap.empty
+let ids_of = ref FieldableMap.empty
 let of_ids = ref PureIdMap.empty
 
 let end_of = ref PureIdMap.empty
 
 
-let get_temporary v =
-  let x = TempVariable(v) in
+let get_fieldable (r, f) =
   try
-    RefinfoMap.find x !ids_of
+    FieldableMap.find (r,f) !ids_of
   with
     Not_found ->
+    let flattened_type = flatten_type (type_of_refinfo r) in
+    let size = List.length flattened_type in
+    (* Asking for a variable will be the same as asking for its first field, if any *)
+    (* TODO: do it for all first fields... *)
+    let () = ids_of := FieldableMap.add (r, NoField) !uid !ids_of in
+    let last = !uid + size - 1 in
+    let add_f field =
       let i = !uid and () = incr uid in
-      let () = info ("Found a referenceable: " ^ (string_of_refinfo x) ^ "[" ^ (string_of_int i) ^ "]") in
+      let y = (r, field) in
+      let () = info ("Found a referenceable: " ^ (string_of_fieldable y) ^ "[" ^ (string_of_int i) ^ "]"
+		     ^ "(end: " ^ (string_of_int last) ^ ")") in
       begin
-        ids_of := RefinfoMap.add x i !ids_of;
-        end_of := PureIdMap.add i i !end_of;
-        of_ids := PureIdMap.add i x !of_ids;
-        i
+	ids_of := FieldableMap.add y i !ids_of;
+	end_of := PureIdMap.add i last !end_of;
+	of_ids := PureIdMap.add i y !of_ids
       end
+    in
+    let () = List.iter add_f flattened_type in
+    FieldableMap.find (r,f) !ids_of
 
-let get_global vi =
-  let x = RealVariable(GlobalVar(vi)) in
-   try
-    RefinfoMap.find x !ids_of
-  with
-    Not_found ->
-      let i = !uid and () = incr uid in
-      let () = info ("Found a referenceable: " ^ (string_of_refinfo x) ^ "[" ^ (string_of_int i) ^ "]") in
-      begin
-        ids_of := RefinfoMap.add x i !ids_of;
-	end_of := PureIdMap.add i i !end_of;
-        of_ids := PureIdMap.add i x !of_ids;
-        i
-      end
+let get_temporary_field v f = get_fieldable (TempVariable(v), f)
+let get_temporary v = get_temporary_field v NoField
+let get_global_field vi f = get_fieldable (RealVariable(GlobalVar(vi)), f)
+let get_global vi = get_global_field vi NoField
+let get_local_field vi fundec f = get_fieldable (RealVariable(LocalVar(vi, fundec)), f)
+let get_local vi fundec = get_local_field vi fundec NoField
 
-let get_local vi fundec =
-  let x = RealVariable(LocalVar(vi, fundec)) in
-  try
-    RefinfoMap.find x !ids_of
-  with
-    Not_found ->
-      let i = !uid and () = incr uid in
-      let () = info ("Found a referenceable: " ^ (string_of_refinfo x) ^ "[" ^ (string_of_int i) ^ "]") in
-      begin
-        ids_of := RefinfoMap.add x i !ids_of;
-        end_of := PureIdMap.add i i !end_of;
-        of_ids := PureIdMap.add i x !of_ids;
-        i
-      end
 
 let get_formals_prototype f =
   let formals =
@@ -183,33 +319,35 @@ let get_formals_prototype f =
          (already_found, acc)
        end
     | name::tl ->
-       let x = RealVariable(FormalVar(name, n, f)) in
+       let r = RealVariable(FormalVar(name, n, f)) in
+       let x = (r, NoField) in
        try
-         let i = RefinfoMap.find x !ids_of in
+         let i = FieldableMap.find x !ids_of in
          add_formals (already_found + 1) (n+1) tl (i :: acc)
        with
          Not_found ->
            let i = !uid and () = incr uid in
            begin
-             ids_of := RefinfoMap.add x i !ids_of;
+             ids_of := FieldableMap.add x i !ids_of;
 	     end_of := PureIdMap.add i end_formals !end_of;
-             info ("Found a referenceable: " ^ (string_of_refinfo x) ^ "[" ^ (string_of_int i) ^ "]" ^ "(end: " ^ (string_of_int end_formals) ^ ")");
+             info ("Found a referenceable: " ^ (string_of_refinfo r) ^ "[" ^ (string_of_int i) ^ "]" ^ "(end: " ^ (string_of_int end_formals) ^ ")");
              of_ids := PureIdMap.add i x !of_ids;
              add_formals already_found (n+1) tl (i :: acc)
            end
   in
   let (already_found, rev_ids) = add_formals 0 0 formals [] in
   let add_return already_found acc =
-    let x = ReturnVar(f) in
+    let r = ReturnVar(f) in
+    let x = (r, NoField) in
     try
-      let i = RefinfoMap.find x !ids_of in
+      let i = FieldableMap.find x !ids_of in
       (already_found + 1, i :: acc)
     with
       Not_found ->
         let i = !uid and () = incr uid in
-        let () = info ("Found a referenceable: " ^ (string_of_refinfo x) ^ "[" ^ (string_of_int i) ^ "]") in
+        let () = info ("Found a referenceable: " ^ (string_of_refinfo r) ^ "[" ^ (string_of_int i) ^ "]") in
         begin
-          ids_of := RefinfoMap.add x i !ids_of;
+          ids_of := FieldableMap.add x i !ids_of;
 	  end_of := PureIdMap.add i i !end_of;
           of_ids := PureIdMap.add i x !of_ids;
           (already_found, i :: acc)
@@ -244,33 +382,6 @@ let id_of r =
 
 let end_of i = PureIdMap.find i !end_of
 
-
-let type_of_refinfo r =
-  match r with
-  | RealVariable(FormalVar(s,i,f)) ->
-     begin
-       match unrollType f.vtype with
-       | TFun(_,args_opt,_,_) ->
-          begin
-            try
-              let args = argsToList args_opt in
-              let (_,t,_) = List.nth args i in
-              t
-            with
-              Failure _ ->
-                invalid_arg ("type_of_refinfo: not enough arguments in " ^ f.vname)
-            | Invalid_argument _ ->
-               invalid_arg ("type_of_refinfo: negative argument in " ^ f.vname)
-          end
-       | _ -> invalid_arg ("type_of_refinfo: type of argument of " ^ f.vname)
-     end
-  | RealVariable(LocalVar(v,f)) -> v.vtype
-  | RealVariable(GlobalVar(v)) -> v.vtype
-  | TempVariable(v) -> v.vtype
-  | ReturnVar(f) ->
-     match unrollType f.vtype with
-     | TFun(rtype,_,_,_) -> rtype
-     | _ -> invalid_arg ("type_of_refinfo: type of " ^ f.vname)
 
 
 let of_id i = PureIdMap.find i !of_ids
@@ -413,7 +524,7 @@ module Vertex = struct
 end
 
 let s_of_vertex n =
-  string_of_refinfo (of_id n) ^ "[" ^ (string_of_int n) ^ "]"
+  string_of_fieldable (of_id n) ^ "[" ^ (string_of_int n) ^ "]"
 
 type edge_constraint =
   | Contains
@@ -422,6 +533,7 @@ type edge_constraint =
   | Star_contains
   | Contains_star_k of int
   | Star_k_contains of int
+  | Contains_k of int
 
 module Edge = struct
    type t = edge_constraint
@@ -435,6 +547,7 @@ let s_of_edge (v1, l, v2) =
   and set_of s = "{ " ^ s ^ " }"
   and star s = "*" ^ s in
   let star_k k s = "*(" ^ s ^ "+" ^ (string_of_int k) ^ ")" in
+  let plus k s = s ^ "+" ^ (string_of_int k) in
   let (left_s, right_s) =
     match l with
     | Contains -> (no_change, no_change)
@@ -443,6 +556,7 @@ let s_of_edge (v1, l, v2) =
     | Star_contains -> (star, no_change)
     | Contains_star_k(k) -> (no_change, star_k k)
     | Star_k_contains(k) -> (star_k k, no_change)
+    | Contains_k(k) -> (no_change, plus k)
   in
   (left_s (s_of_vertex v1)) ^ " > " ^ (right_s (s_of_vertex v2))
 
@@ -455,59 +569,54 @@ let dump_graph g =
     g
 
 
-let rec get_varinfo_exp expr =
-  match expr with
-  | Const(c) -> invalid_arg "get_varinfo_exp: constant"
-  | Lval(lval) -> get_varinfo_lval lval
-  | SizeOf(_)
-  | SizeOfE(_)
-  | SizeOfStr(_)
-  | AlignOf(_)
-  | AlignOfE(_) -> invalid_arg "get_varinfo_exp: sizeof/alignof"
-  | UnOp(_,exp,_) -> get_varinfo_exp exp
-  | BinOp(_,e1,e2,_) -> get_varinfo_exp e1
-  | Question(e,e1,e2,_) -> invalid_arg "get_varinfo_exp"
-  | CastE(_,exp) -> get_varinfo_exp exp
-  | AddrOf(lval) -> get_varinfo_lval lval
-  (* Used for ComputedGoto, analysis not needed because we will go
-     through the label (it must be in the same function *)
-  | AddrOfLabel(_) -> invalid_arg "get_varinfo_exp"
-  | StartOf(lval) -> get_varinfo_lval lval
-and get_varinfo_lval (lhost, offset) =
-  get_varinfo_lhost lhost
-and get_varinfo_lhost lhost =
-  match lhost with
-  | Var(vi) -> vi
-  | Mem(exp) -> get_varinfo_exp exp
 
 type dereferencing =
-  | D_irrelevant
-  | D_i of int * typ
-  | D_index of int * int * typ (* Dereferencing pertaining to parameters of function pointers calls arguments and return *)
-  | D_addr of dereferencing
-  | D_mem of dereferencing
+  | D_irrelevant of typ
+  | D_i of int * typ (* Applicable to variables that are not related to structures *)
+  | D_field of dereferencing * field (* Applicable to fields and variables of structure type *)
+  | D_index of int * int * typ (* Applicable to function pointer calls *)
+  | D_addr of dereferencing (* Applicable to any address taking *)
+  | D_mem of dereferencing (* Applicable to any dereferencing *)
+
+
+let rec type_of_dereferencing d =
+  match d with
+  | D_irrelevant(ty) -> ty
+  | D_i(_,ty) -> ty
+  | D_field(e,f) ->
+     let ty = type_of_dereferencing e in
+     type_of_field ty f
+  | D_index(_,_,ty) -> ty
+  | D_addr(d) -> TPtr(type_of_dereferencing d, [])
+  | D_mem(d) ->
+     let type_of_d = type_of_dereferencing d in
+     match unrollType type_of_d with
+     | TPtr(ty,_) -> ty
+     | _ -> invalid_arg "type_of_dereferencing"
 
 
 let rec string_of_dereferencing d =
   match d with
-  | D_irrelevant -> "_"
+  | D_irrelevant(_) -> "_"
   | D_i(i,_) -> s_of_vertex i
-  | D_index(p,k,_) -> (string_of_int p) ^ " + " ^ (string_of_int k)
-  | D_addr(e) -> "&" ^ (string_of_dereferencing e)
-  | D_mem(e) -> "*" ^ (string_of_dereferencing e)
+  | D_field(e,f) -> (string_of_dereferencing e) ^ "{" ^ (string_of_field f) ^ "}"
+  | D_index(p,k,_) -> (string_of_int p) ^ "+" ^ (string_of_int k)
+  | D_addr(e) -> "&(" ^ (string_of_dereferencing e) ^ ")"
+  | D_mem(e) -> "*(" ^ (string_of_dereferencing e) ^ ")"
 
 
 let rec is_irrelevant = function
-  | D_irrelevant -> true
+  | D_irrelevant(_) -> true
   | D_i(_) -> false
+  | D_field(d,_) -> is_irrelevant d
   | D_index(_) -> false
-  | D_addr(d) -> is_irrelevant(d)
-  | D_mem(d) -> is_irrelevant(d)
+  | D_addr(d) -> is_irrelevant d
+  | D_mem(d) -> is_irrelevant d
 
 
 let rec build_dereferencing_expr f expr =
   match expr with
-  | Const(const) -> D_irrelevant
+  | Const(const) -> D_irrelevant(typeOf expr)
   | Lval(lval) -> build_dereferencing_lval f lval
   | SizeOf(_)
   | SizeOfE(_)
@@ -515,14 +624,27 @@ let rec build_dereferencing_expr f expr =
   | AlignOf(_)
   | AlignOfE(_)
   | UnOp(_)
-  | BinOp(_) -> D_irrelevant (*TODO *)
-  | Question(_) -> (*TODO *) D_irrelevant
+  | BinOp(_) -> D_irrelevant(typeOf expr) (*TODO *)
+  | Question(_) -> (*TODO *) D_irrelevant(typeOf expr)
   | CastE(_,e) -> build_dereferencing_expr f e
-  | AddrOfLabel(_) -> D_irrelevant
+  | AddrOfLabel(_) -> D_irrelevant(typeOf expr)
   | AddrOf(lval)
   | StartOf(lval) -> D_addr(build_dereferencing_lval f lval)
 and build_dereferencing_lval f (lhost, offset) =
-  build_dereferencing_lhost f lhost
+  let field = build_dereferencing_offset offset in
+  let deref_lhost = build_dereferencing_lhost f lhost in
+  let lhost_type = type_of_dereferencing deref_lhost in
+  match field with
+  | NoField -> deref_lhost
+  | _ ->
+     match unrollType lhost_type with
+     | TComp(_) -> D_field(deref_lhost, field)
+     | _ -> assert false
+and build_dereferencing_offset offset =
+  match offset with
+  | NoOffset -> NoField
+  | Field(fi, ofs)-> Field(fi.fname, build_dereferencing_offset ofs)
+  | Index(_,ofs) -> build_dereferencing_offset ofs
 and build_dereferencing_lhost f lhost =
   match lhost with
   | Var(vi) ->
@@ -547,93 +669,265 @@ and build_dereferencing_lhost f lhost =
   | Mem(expr) -> D_mem(build_dereferencing_expr f expr)
 
 
-let rec type_of_dereferencing d =
-  match d with
-  | D_irrelevant -> assert false
-  | D_i(_, ty) -> ty
-  | D_index(_,_,ty) -> ty
-  | D_addr(d) -> TPtr(type_of_dereferencing d, [])
-  | D_mem(d) ->
-     let type_of_d = type_of_dereferencing d in
-     match unrollType type_of_d with
-     | TPtr(ty,_) -> ty
-     | _ -> invalid_arg "type_of_dereferencing"
+let build_dereferencing_refinfo r = D_i(id_of r, type_of_refinfo r)
 
 
-let string_of_constraint left right =
+let string_of_constraint (left, right) =
   (string_of_dereferencing left)
   ^ " = "
   ^ (string_of_dereferencing right)
 
-let rec build_constraints left right =
-  match (left, right) with
-  | D_irrelevant, _ -> assert false
-  | _, D_irrelevant -> []
-  | D_i(i1,_), D_i(i2,_) -> [ (i1, Contains, i2) ]
-  | D_i(i1,_), D_addr(D_i(i2,_)) -> [ (i1, Points_to, i2) ]
-  | D_i(i1,_), D_mem(D_i(i2,_)) -> [ (i1, Contains_star, i2) ]
-  | D_i(i1, _), D_index(p,k,_) -> [ (i1, Contains_star_k(k), p) ]
-  | D_i(i1, ty), _ ->
-     build_constraints_right i1 ty right
-  | D_mem(D_i(i1,_)), D_i(i2,_) -> [ (i1, Star_contains, i2) ]
-  | D_mem(_), D_i(i2,ty) ->
-     build_constraints_left left i2 ty
-  | D_index(p,k,_), D_i(i2,_) -> [ (p, Star_k_contains(k), i2) ]
-  | D_addr(_), _ -> assert false
-  | _, _ ->
-     let type_of_d = type_of_dereferencing right in
-     let tmp_var = makeVarinfo true "tmp_" type_of_d in
+(*
+  p > q          provient de x = y
+  p > {q}        provient de x = &y
+  p > *q         provient de x = *y
+  *p > q         provient de *x = y
+  p > *(q+k)     provient de x = *p(...k-1 args)   ou x = y->k (soit x = ( *y).k)
+  *(p+k) > q     provient de *p(...,y,...) avec y le k-ième arg   ou x->k = y (soit ( *x).k = y)
+  p > q+k        provient de x = &y->k (soit x = &(( *y).k)
+ *)
+
+(* These functions transforms the dereferencing into their canonical forms (e.g. **x will become *y with y = *x) *)
+let simplify_dereferencing d =
+  match d with
+  | D_irrelevant(_)
+  | D_i(_)                            (* p *)
+  | D_index(_)                        (* f(...,p,...) *)
+  | D_field(D_i(_),_)                 (* p.f *)
+  | D_field(D_mem(D_i(_)),_)          (* p->f *)
+  | D_mem(D_i(_))                     (* *p *)
+  | D_mem(D_field(D_i(_),_))          (* *(p.f) *)
+  | D_addr(D_i(_))                    (* &p *)
+  | D_addr(D_field(D_i(_),_))         (* &p.f *)
+  | D_addr(D_field(D_mem(D_i(_)),_))  (* &p->f *)
+    -> (d, None)
+  | D_field(x,f) ->
+     let type_of_x = type_of_dereferencing x in
+     let tmp_var = makeVarinfo true "tmp_" type_of_x in
      let () = tmp_var.vname <- "tmp_" ^ (string_of_int tmp_var.vid) in
      let idx = get_temporary tmp_var in
+     let i = D_i(idx, type_of_x) in
+     let d' = D_field(i, f) in
+     let ((d1, d2) as assign) = (i, x) in
      let () = info (
-       "Transforming " ^ (string_of_constraint left right)
-       ^ " into " ^ (string_of_constraint left (D_i(idx,type_of_d)))
-       ^ " and " ^ (string_of_constraint (D_i(idx,type_of_d)) right))
+       "Transforming " ^ (string_of_dereferencing d)
+       ^ " into " ^ (string_of_dereferencing d')
+       ^ " with " ^ (string_of_constraint assign))
      in
-     let sub_constraints_left = build_constraints left (D_i(idx, type_of_d)) in
-     let sub_constraints_right = build_constraints (D_i(idx, type_of_d)) right in
-     sub_constraints_left @ sub_constraints_right
-and build_constraints_right i ityp right =
-  match right with
-  | D_irrelevant
-  | D_i(_)
-  | D_index(_)
-  | D_mem(D_i(_))
-  | D_addr(D_i(_)) -> assert false
+     (d', Some(assign))
+  | D_addr(x) -> assert false
   | D_mem(x) ->
      let type_of_x = type_of_dereferencing x in
      let tmp_var = makeVarinfo true "tmp_" type_of_x in
      let () = tmp_var.vname <- "tmp_" ^ (string_of_int tmp_var.vid) in
      let idx = get_temporary tmp_var in
+     let i = D_i(idx, type_of_x) in
+     let d' = D_mem(i) in
+     let ((d1, d2) as assign) = (i, x) in
      let () = info (
-       "Transforming " ^ (string_of_constraint (D_i(i, ityp)) right)
-       ^ " into " ^ (string_of_constraint (D_i(i, ityp)) (D_mem(D_i(idx, type_of_x))))
-       ^ " and " ^ (string_of_constraint (D_i(idx, type_of_x)) x))
+       "Transforming " ^ (string_of_dereferencing d)
+       ^ " into " ^ (string_of_dereferencing d')
+       ^ " with " ^ (string_of_constraint assign))
      in
-     let sub_constraints_left = build_constraints (D_i(i, ityp)) (D_mem(D_i(idx, type_of_x))) in
-     let sub_constraints_right = build_constraints (D_i(idx, type_of_x)) x in
-     sub_constraints_left @ sub_constraints_right
-  | D_addr(x) -> assert false
-and build_constraints_left left i ityp =
-  match left with
-  | D_irrelevant
-  | D_i(_)
-  | D_index(_)
-  | D_addr(_)
-  | D_mem(D_i(_)) -> assert false
-  | D_mem(x) ->
-     let type_of_x = type_of_dereferencing x in
-     let tmp_var = makeVarinfo false "tmp_" type_of_x in
-     let () = tmp_var.vname <- "tmp_" ^ (string_of_int tmp_var.vid) in
+     (d', Some(assign))
+
+let rec simplify_constraint (d1, d2) =
+  let (d1', opt_c1) = simplify_dereferencing d1
+  and (d2', opt_c2) = simplify_dereferencing d2 in
+  match opt_c1, opt_c2 with
+  | None, None -> [ (d1', d2') ]
+  | Some(c1), None ->
+     let res = simplify_constraint c1 in
+     res @ [ (d1', d2') ]
+  | None, Some(c2) ->
+     let res = simplify_constraint c2 in
+     res @ [ (d1', d2') ]
+  |  Some(c1), Some(c2) ->
+     let res1 = simplify_constraint c1 in
+     let res2 = simplify_constraint c2 in
+      res1 @ res2 @ [ (d1', d2') ]
+and simplify_constraints ds =
+  List.flatten (List.map simplify_constraint ds)
+
+
+let canonical_dereferencing d =
+  match d with
+  | D_irrelevant(_)
+  | D_i(_)                            (* p *)
+  | D_index(_)                        (* f(...,p,...) *)
+  | D_field(D_i(_),_)                 (* p.f *)
+  | D_field(D_mem(D_i(_)),_)          (* p->f *)
+  | D_mem(D_i(_))                     (* *p *)
+  | D_mem(D_field(D_i(_),_))          (* *(p.f) *)
+  | D_addr(D_i(_))                    (* &p *)
+  | D_addr(D_field(D_i(_),_))         (* &p.f *)
+  | D_addr(D_field(D_mem(D_i(_)),_))  (* &p->f *)
+    -> true
+  | _ -> false (* TODO: still not sure about D_field(D_field(...)) *)
+
+
+let remove_irrelevant constraints =
+  let rec aux_remove acc cs =
+    match cs with
+    | [] -> List.rev acc
+    | ((d1, d2) as c)::tl ->
+       match d1, d2 with
+       | D_irrelevant(_), _
+       | _, D_irrelevant(_) -> aux_remove acc tl
+       | _, _ -> aux_remove (c::acc) tl
+  in
+  aux_remove [] constraints
+
+
+let canonicalize_constraint ((d1, d2) as c) =
+  assert ((canonical_dereferencing d1) && (canonical_dereferencing d2));
+  match d1, d2 with
+  | D_i(_), _ -> [c]
+  | D_field(D_i(_),_), _ -> [c]
+  | D_addr(_), _ -> assert false
+  | D_mem(D_i(_) | D_field(D_i(_),_)), D_i(_)
+  | D_mem(D_i(_) | D_field(D_i(_),_)), D_field(D_i(_),_)
+  | D_index(_), (D_i(_) | D_field(D_i(_),_))
+  | D_field(D_mem(D_i(_)),_), (D_i(_) | D_field(D_i(_),_)) -> [c]
+
+  | D_mem(D_i(_) | D_field(D_i(_),_)), _
+  | D_index(_), _
+  | D_field(D_mem(D_i(_)),_), _ ->
+     let type_of_d2 = type_of_dereferencing d2 in
+     let tmp_var = makeVarinfo true "tmp_split_" type_of_d2 in
+     let () = tmp_var.vname <- "tmp_split_" ^ (string_of_int tmp_var.vid) in
      let idx = get_temporary tmp_var in
+     let i = D_i(idx, type_of_d2) in
+     let c1 = (d1, i) in
+     let c2 = (i, d2) in
      let () = info (
-       "Transforming " ^ (string_of_constraint left (D_i(i,ityp)))
-       ^ " into " ^ (string_of_constraint (D_mem(D_i(idx,type_of_x))) (D_i(i,ityp)))
-       ^ " and " ^ (string_of_constraint (D_i(idx,type_of_x)) x))
+       "Transforming " ^ (string_of_constraint c)
+       ^ " into " ^ (string_of_constraint c1)
+       ^ " and " ^ (string_of_constraint c2))
      in
-     let sub_constraints_left = build_constraints (D_mem(D_i(idx,type_of_x))) (D_i(i,ityp)) in
-     let sub_constraints_right = build_constraints (D_i(idx,type_of_x)) x in
-     sub_constraints_left @ sub_constraints_right
+     [c2; c1]
+  | _ -> assert false
+
+
+let generate_constraints c =
+  let simple_constraints = simplify_constraint c in
+  let no_irrelevant = remove_irrelevant simple_constraints in
+  List.flatten (List.map canonicalize_constraint no_irrelevant)
+
+(* TODO: iterate over fields to have all the real constraints *)
+let build_Contains d1 d2 =
+  match d1, d2 with
+  | D_i(i1, t1), D_i(i2, t2) -> (i1, Contains, i2)
+  | D_i(i1, t1), D_field(D_i(i2, t2),f2) -> (i1, Contains, i2 + (get_field_number t2 f2))
+  | D_field(D_i(i1, t1),f1), D_i(i2, t2) -> (i1 + (get_field_number t1 f1), Contains, i2)
+  | D_field(D_i(i1, t1),f1), D_field(D_i(i2, t2),f2) -> (i1 + (get_field_number t1 f1), Contains, i2 + (get_field_number t2 f2))
+  | _ -> assert false
+
+let build_Points_to d1 d2 =
+  match d1, d2 with
+  | D_i(i1,t1), D_addr(D_i(i2,t2)) -> (i1, Points_to, i2)
+  | D_field(D_i(i1,t1),f1), D_addr(D_i(i2,t2)) -> (i1 + (get_field_number t1 f1), Points_to, i2)
+  | _ -> assert false
+
+let build_Contains_star d1 d2 =
+  match d1, d2 with
+  | D_i(i1,t1), D_mem(D_i(i2,t2)) -> (i1, Contains_star, i2)
+  | D_i(i1,t1), D_mem(D_field(D_i(i2,t2),f2)) -> (* TODO: is it really there ? *)
+     (i1, Contains_star, i2 + (get_field_number t2 f2))
+  | D_field(D_i(i1,t1),f1), D_mem(D_i(i2,t2)) -> (i1 + (get_field_number t1 f1), Contains_star, i2)
+  | D_field(D_i(i1,t1),f1), D_mem(D_field(D_i(i2,t2),f2)) -> (* TODO: is it really there ? *)
+     (i1 + (get_field_number t1 f1), Contains_star, i2 + (get_field_number t2 f2))
+  | _ -> assert false
+
+let build_Contains_star_k d1 d2 =
+  match d1, d2 with
+  | D_i(i1,t1), D_field(D_mem(D_i(i2,t2)),f2) -> (i1, Contains_star_k(get_field_number t2 f2), i2)
+  | D_i(i1,t1), D_index(i2,k,t2) -> (i1, Contains_star_k(k), i2)
+  | D_field(D_i(i1,t1),f1), D_field(D_mem(D_i(i2,t2)),f2) -> (i1 + (get_field_number t1 f1), Contains_star_k(get_field_number t2 f2), i2)
+  | D_field(D_i(i1,t1),f1), D_index(i2,k,t2) -> (i1 + (get_field_number t1 f1), Contains_star_k(k), i2)
+  | _ -> assert false
+
+let build_Contains_k d1 d2 =
+  match d1, d2 with
+  | D_i(i1,t1), D_addr(D_field(D_i(i2,t2),f2)) -> (i1, Contains_k(get_field_number t2 f2), i2)
+  | D_i(i1,t1), D_addr(D_field(D_mem(D_i(i2,t2)),f2)) -> (i1, Contains_k(get_field_number t2 f2), i2)
+  | D_field(D_i(i1,t1),f1), D_addr(D_field(D_i(i2,t2),f2)) -> (i1 + (get_field_number t1 f1), Contains_k(get_field_number t2 f2), i2)
+  | D_field(D_i(i1,t1),f1), D_addr(D_field(D_mem(D_i(i2,t2)),f2)) -> (i1 + (get_field_number t1 f1), Contains_k(get_field_number t2 f2), i2)
+  | _ -> assert false
+
+let build_Star_contains d1 d2 =
+  match d1, d2 with
+  | D_mem(D_i(i1,t1)), D_i(i2,t2) -> (i1, Star_contains, i2)
+  | D_mem(D_field(D_i(i1,t1),f1)), D_i(i2,t2) -> (i1 + (get_field_number t1 f1), Star_contains, i2)
+  | D_mem(D_i(i1,t1)), D_field(D_i(i2,t2),f2) -> (i1, Star_contains, i2 + (get_field_number t2 f2))
+  | D_mem(D_field(D_i(i1,t1),f1)), D_field(D_i(i2,t2),f2) -> (i1 + (get_field_number t1 f1), Star_contains, i2 + (get_field_number t2 f2))
+  | _ -> assert false
+
+let build_Star_k_contains d1 d2 =
+  match d1, d2 with
+  | D_index(i1,k,t1), D_i(i2,t2) -> (i1, Star_k_contains(k), i2)
+  | D_index(i1,k,t1), D_field(D_i(i2,t2),f2) -> (i1, Star_k_contains(k), i2 + (get_field_number t2 f2))
+  | D_field(D_mem(D_i(i1,t1)),f1), D_i(i2,t2) -> (i1, Star_k_contains(get_field_number t1 f1), i2)
+  | D_field(D_mem(D_i(i1,t1)),f1), D_field(D_i(i2,t2),f2) -> (i1, Star_k_contains(get_field_number t1 f1), i2 + (get_field_number t2 f2))
+  | _ -> assert false
+
+
+let finalize_constraint (d1, d2) =
+  match d1, d2 with
+  | D_i(_), D_i(_)
+  | D_i(_), D_field(D_i(_),_)
+  | D_field(D_i(_),_), D_i(_)
+  | D_field(D_i(_),_), D_field(D_i(_),_) -> build_Contains d1 d2
+
+  | D_i(_), D_addr(D_i(_))
+  | D_field(D_i(_),_), D_addr(D_i(_)) -> build_Points_to d1 d2
+
+  | D_i(_), D_mem(D_i(_))
+  | D_i(_), D_mem(D_field(D_i(_),_))
+  | D_field(D_i(_),_), D_mem(D_i(_))
+  | D_field(D_i(_),_), D_mem(D_field(D_i(_),_)) -> build_Contains_star d1 d2
+
+  | D_i(_), D_field(D_mem(D_i(_)),_)
+  | D_i(_), D_index(_)
+  | D_field(D_i(_),_), D_field(D_mem(D_i(_)),_)
+  | D_field(D_i(_),_), D_index(_) -> build_Contains_star_k d1 d2
+
+  | D_i(_), D_addr(D_field(D_i(_),_))
+  | D_i(_), D_addr(D_field(D_mem(D_i(_)),_))
+  | D_field(D_i(_),_), D_addr(D_field(D_i(_),_))
+  | D_field(D_i(_),_), D_addr(D_field(D_mem(D_i(_)),_)) -> build_Contains_k d1 d2
+
+  | D_mem(D_i(_)), D_i(_)
+  | D_mem(D_field(D_i(_),_)), D_i(_)
+  | D_mem(D_i(_)), D_field(D_i(_),_)
+  | D_mem(D_field(D_i(_),_)), D_field(D_i(_),_) ->  build_Star_contains d1 d2
+
+  | D_index(_), D_i(_)
+  | D_index(_), D_field(D_i(_),_)
+  | D_field(D_mem(D_i(_)),_), D_i(_)
+  | D_field(D_mem(D_i(_)),_), D_field(D_i(_),_) -> build_Star_k_contains d1 d2
+
+  | _ -> assert false
+
+
+let build_constraints c =
+  let generated = generate_constraints c in
+  List.map finalize_constraint generated
+
+
+(*
+  Les seules constructions possibles sont donc:
+  D_i et D_f(D_i) pour p
+  D_addr(D_i) pour {q}
+  D_mem(D_i) et D_mem(D_f(D_i)) pour *q/*p
+  D_index pour *(p+k) (cas appel de fonctions par pointeur)
+  D_f(D_mem(D_i)) pour *(p+k) (cas champ de structure)
+  D_addr(D_f(D_i)) et D_addr(D_f(D_mem(D_i))) pour p+k
+
+Les constructions plus "profondes" doivent être simplifiées.
+Une fois les constructions toutes à l'un de ces formats, il faut rattacher les contraintes aux
+contraintes acceptables ci-dessus, donc il peut y avoir une étape supplémentaire de séparation.
+*)
 
 
 let get_constraints ct =
@@ -641,15 +935,15 @@ let get_constraints ct =
   | CRefExpr(r, (e,f)) ->
      let c_left = D_i(id_of r, type_of_refinfo r) in
      let c_right = build_dereferencing_expr f e in
-     build_constraints c_left c_right
+     build_constraints (c_left, c_right)
   | CLvalExpr((l,f1), (e,f2)) ->
      let c_left = build_dereferencing_lval f1 l in
      let c_right = build_dereferencing_expr f2 e in
-     build_constraints c_left c_right
+     build_constraints (c_left, c_right)
   | CLvalRef((l,f), r) ->
      let c_left = build_dereferencing_lval f l in
      let c_right = D_i(id_of r, type_of_refinfo r) in
-     build_constraints c_left c_right
+     build_constraints (c_left, c_right)
   | CFunPtrCall(lval_opt, exp, exps, f) ->
      let (funptr_i, simplif_constraints) =
        match exp with
@@ -667,21 +961,21 @@ let get_constraints ct =
           let idx = get_temporary tmp_var in
           let c_left = D_i(idx, type_of_complex) in
           let c_right = build_dereferencing_expr f complex in
-          let new_constraints = build_constraints c_left c_right in
+          let new_constraints = build_constraints (c_left, c_right) in
           (idx, new_constraints)
        | _ -> assert false (* All calls to function pointers should at least be of the Lval(Mem(...),...) shape *)
      in
      let build_constraint_param k expr =
-       build_constraints (D_index(funptr_i, k, typeOf expr)) (build_dereferencing_expr f expr)
+       build_constraints ((D_index(funptr_i, k, typeOf expr)), (build_dereferencing_expr f expr))
      in
      let each_param_constraints = List.mapi build_constraint_param exps in
      let return_constraint =
        match lval_opt with
        | None -> []
        | Some(lval) ->
-          build_constraints (build_dereferencing_lval f lval) (D_index(funptr_i, List.length exps, typeOfLval lval))
+          build_constraints ((build_dereferencing_lval f lval), (D_index(funptr_i, List.length exps, typeOfLval lval)))
      in
-     List.concat (return_constraint :: each_param_constraints)
+    List.concat (return_constraint :: simplif_constraints :: each_param_constraints)
 
 
 let graph_of_relationships relationships =
@@ -850,6 +1144,43 @@ let rule_deref5 witness g p =
   let add_r qs r = List.iter (fun e -> add_edge_kq_r e r) qs in
   List.iter
     (add_r all_qs)
+    all_rs
+
+
+let rule_add witness g q =
+  let rule_prefix = "rule_add " ^ (string_of_int q) in
+  let all_pred_edges = G.pred_e g q in
+  let all_succs = G.succ g q in
+  let all_ps =
+    List.filter (fun e -> match e with (p, Contains_k(k), q) -> true | _ -> false) all_pred_edges
+  in
+  let all_rs = List.filter (fun r -> G.mem_edge_e g (q, Points_to, r)) all_succs in
+  let add_p_r p k r =
+    let s = r + k in
+    let end_of_r = end_of r in
+    if s <= end_of_r then (* FIXME: beware of the Not_found (which should not happen) *)
+      if not (G.mem_edge_e g (p, Points_to, s))
+      then begin
+        let hyp1 = s_of_edge (p, Contains_k(k), q) in
+        let hyp2 = s_of_edge (q, Points_to, r) in
+        let hyp3 = "idx(" ^ (string_of_int s) ^ ") = idx(" ^ (string_of_int r) ^ ")+" ^ (string_of_int k) in
+        let hyp4 = "idx(" ^ (string_of_int s) ^ ") <= end(" ^ (string_of_int end_of_r) ^ ")" in
+        let new_edge = (p, Points_to, s) in
+        let res = s_of_edge new_edge in
+        let addition = rule_prefix ^ ": [" ^ hyp1 ^ "]  +  [" ^ hyp2 ^ "] + [" ^ hyp3 ^ "] + [" ^ hyp4 ^ "]  =  [" ^ res ^ "]" in
+        G.add_edge_e g new_edge;
+        info addition;
+        witness := true
+      end
+  in
+  let add_edge_pk_r e r =
+    match e with
+    | (p, Contains_k(k), q) -> add_p_r p k r
+    | _ -> assert false
+  in
+  let add_r ps r = List.iter (fun e -> add_edge_pk_r e r) ps in
+  List.iter
+    (add_r all_ps)
     all_rs
 
 
