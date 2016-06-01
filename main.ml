@@ -839,20 +839,26 @@ let build_Contains_star d1 d2 =
      (i1 + (get_field_number t1 f1), Contains_star, i2 + (get_field_number t2 f2))
   | _ -> assert false
 
+
+let unPtrType t =
+  match unrollType t with
+  | TPtr(u,_) -> u
+  | _ -> assert false
+
 let build_Contains_star_k d1 d2 =
   match d1, d2 with
-  | D_i(i1,t1), D_field(D_mem(D_i(i2,t2)),f2) -> (i1, Contains_star_k(get_field_number t2 f2), i2)
+  | D_i(i1,t1), D_field(D_mem(D_i(i2,t2)),f2) -> (i1, Contains_star_k(get_field_number (unPtrType t2) f2), i2)
   | D_i(i1,t1), D_index(i2,k,t2) -> (i1, Contains_star_k(k), i2)
-  | D_field(D_i(i1,t1),f1), D_field(D_mem(D_i(i2,t2)),f2) -> (i1 + (get_field_number t1 f1), Contains_star_k(get_field_number t2 f2), i2)
+  | D_field(D_i(i1,t1),f1), D_field(D_mem(D_i(i2,t2)),f2) -> (i1 + (get_field_number t1 f1), Contains_star_k(get_field_number (unPtrType t2) f2), i2)
   | D_field(D_i(i1,t1),f1), D_index(i2,k,t2) -> (i1 + (get_field_number t1 f1), Contains_star_k(k), i2)
   | _ -> assert false
 
 let build_Contains_k d1 d2 =
   match d1, d2 with
   | D_i(i1,t1), D_addr(D_field(D_i(i2,t2),f2)) -> (i1, Contains_k(get_field_number t2 f2), i2)
-  | D_i(i1,t1), D_addr(D_field(D_mem(D_i(i2,t2)),f2)) -> (i1, Contains_k(get_field_number t2 f2), i2)
+  | D_i(i1,t1), D_addr(D_field(D_mem(D_i(i2,t2)),f2)) -> (i1, Contains_k(get_field_number (unPtrType t2) f2), i2)
   | D_field(D_i(i1,t1),f1), D_addr(D_field(D_i(i2,t2),f2)) -> (i1 + (get_field_number t1 f1), Contains_k(get_field_number t2 f2), i2)
-  | D_field(D_i(i1,t1),f1), D_addr(D_field(D_mem(D_i(i2,t2)),f2)) -> (i1 + (get_field_number t1 f1), Contains_k(get_field_number t2 f2), i2)
+  | D_field(D_i(i1,t1),f1), D_addr(D_field(D_mem(D_i(i2,t2)),f2)) -> (i1 + (get_field_number t1 f1), Contains_k(get_field_number (unPtrType t2) f2), i2)
   | _ -> assert false
 
 let build_Star_contains d1 d2 =
@@ -867,8 +873,8 @@ let build_Star_k_contains d1 d2 =
   match d1, d2 with
   | D_index(i1,k,t1), D_i(i2,t2) -> (i1, Star_k_contains(k), i2)
   | D_index(i1,k,t1), D_field(D_i(i2,t2),f2) -> (i1, Star_k_contains(k), i2 + (get_field_number t2 f2))
-  | D_field(D_mem(D_i(i1,t1)),f1), D_i(i2,t2) -> (i1, Star_k_contains(get_field_number t1 f1), i2)
-  | D_field(D_mem(D_i(i1,t1)),f1), D_field(D_i(i2,t2),f2) -> (i1, Star_k_contains(get_field_number t1 f1), i2 + (get_field_number t2 f2))
+  | D_field(D_mem(D_i(i1,t1)),f1), D_i(i2,t2) -> (i1, Star_k_contains(get_field_number (unPtrType t1) f1), i2)
+  | D_field(D_mem(D_i(i1,t1)),f1), D_field(D_i(i2,t2),f2) -> (i1, Star_k_contains(get_field_number (unPtrType t1) f1), i2 + (get_field_number t2 f2))
   | _ -> assert false
 
 
@@ -1091,7 +1097,7 @@ let rule_deref4 witness g q =
         let hyp2 = s_of_edge (q, Points_to, r) in
         let hyp3 = "idx(" ^ (string_of_int s) ^ ") = idx(" ^ (string_of_int r) ^ ")+" ^ (string_of_int k) in
         let hyp4 = "idx(" ^ (string_of_int s) ^ ") <= end(" ^ (string_of_int end_of_r) ^ ")" in
-        let new_edge = (p, Contains, r) in
+        let new_edge = (p, Contains, s) in
         let res = s_of_edge new_edge in
         let addition = rule_prefix ^ ": [" ^ hyp1 ^ "]  +  [" ^ hyp2 ^ "] + [" ^ hyp3 ^ "] + [" ^ hyp4 ^ "]  =  [" ^ res ^ "]" in
         G.add_edge_e g new_edge;
