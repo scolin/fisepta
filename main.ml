@@ -1202,6 +1202,7 @@ let compute_constraints g =
       G.iter_vertex (fun v -> rule_deref2 has_changed g v) g;
       G.iter_vertex (fun v -> rule_deref4 has_changed g v) g;
       G.iter_vertex (fun v -> rule_deref5 has_changed g v) g;
+      G.iter_vertex (fun v -> rule_add has_changed g v) g;
       if !has_changed then (has_changed := false; incr i; steps ())
     end
   in
