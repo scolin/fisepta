@@ -3,6 +3,12 @@ open Pretty
 
 let input_file = ref ""
 
+(* TODO: remaining tasks:
+  - unions
+  - initializations
+  - heap allocations
+ *)
+
 let set_input_file s =
   input_file := s
 
@@ -452,6 +458,7 @@ type constraint_origin =
   | CLvalRef of (lval * fundec) * refinfo
   | CFunPtrCall of lval option * exp * exp list * fundec
 
+(* TODO: also visit initializations *)
 class constraintVisitorClass seenFunctions =
   object(self)
   inherit Cil.nopCilVisitor
