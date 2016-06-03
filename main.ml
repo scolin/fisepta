@@ -177,13 +177,38 @@ let rec get_field_number typ field =
      | _ -> invalid_arg "get_offset_field: not a structure/union"
 
 
+let prepend_field s = List.map (fun f -> Field(s, f))
+
+let prepend_first_field s field_list = (prepend_field s field_list) @ [ NoField ]
+
+(* In case of struct, the list contains an expansion of the struct,
+   where each element is a field name and its alternative names
+   (e.g. x is also x.f is f is the first field).  In case of nested
+   fields there might be more than 1 alternative name, hence the list.
+   By construction, we ensure that the first alternative of a name is
+   the full (this is why we put [ NoField ] at the end in the
+   prepend_first_field function above *)
 let rec flatten_type t =
   match unrollType t with
   | TComp(ci,_) -> flatten_fields ci
-  | _ -> [ NoField ]
+  | _ -> [ [ NoField ] ]
 and flatten_fields ci =
-  List.concat (List.map expand_field ci.cfields)
-and expand_field fi = List.map (fun x -> Field(fi.fname, x)) (flatten_type fi.ftype)
+  let no_missing = List.filter (fun fi -> fi.fname <> missingFieldName) ci.cfields in
+  let flattened_fields = List.map (fun fi -> (fi.fname, flatten_type fi.ftype)) no_missing in
+  match flattened_fields with
+  | [] -> []
+  | (s, hd)::tl -> (* hd is a list of fields, each with its alternative name *)
+     let first_list =
+       match hd with
+       | [] -> []
+       | subhd :: subtl ->
+	  let prepended_subhd = prepend_first_field s subhd in
+	  let prepended_tl = List.map (prepend_field s) subtl
+	  in prepended_subhd :: prepended_tl
+     in
+     let rest = List.flatten (List.map (fun (name, sublist) -> List.map (prepend_field name) sublist) tl) in
+     first_list @ rest
+
 
 let rec type_of_field typ field =
   match field with
@@ -276,20 +301,23 @@ let get_fieldable (r, f) =
     Not_found ->
     let flattened_type = flatten_type (type_of_refinfo r) in
     let size = List.length flattened_type in
-    (* Asking for a variable will be the same as asking for its first field, if any *)
-    (* TODO: do it for all first fields... *)
-    let () = ids_of := FieldableMap.add (r, NoField) !uid !ids_of in
     let last = !uid + size - 1 in
-    let add_f field =
-      let i = !uid and () = incr uid in
-      let y = (r, field) in
-      let () = info ("Found a referenceable: " ^ (string_of_fieldable y) ^ "[" ^ (string_of_int i) ^ "]"
-		     ^ "(end: " ^ (string_of_int last) ^ ")") in
+    let add_to_ids i x =
       begin
-	ids_of := FieldableMap.add y i !ids_of;
-	end_of := PureIdMap.add i last !end_of;
-	of_ids := PureIdMap.add i y !of_ids
+	info ("Found a referenceable: " ^ (string_of_fieldable x) ^ "[" ^ (string_of_int i) ^ "]" ^ "(end: " ^ (string_of_int last) ^ ")");
+	ids_of := FieldableMap.add x i !ids_of
       end
+    in
+    let add_f field_and_altnames =
+      let i = !uid and () = incr uid in
+      match field_and_altnames with
+      | [] -> assert false
+      | full_name :: _ ->
+	 begin
+	   end_of := PureIdMap.add i last !end_of;
+	   of_ids := PureIdMap.add i (r,full_name) !of_ids;
+	   List.iter (add_to_ids i) (List.map (fun field -> (r,field)) field_and_altnames)
+	 end
     in
     let () = List.iter add_f flattened_type in
     FieldableMap.find (r,f) !ids_of
