@@ -814,67 +814,155 @@ let generate_constraints c =
   let no_irrelevant = remove_irrelevant simple_constraints in
   List.flatten (List.map canonicalize_constraint no_irrelevant)
 
-(* TODO: iterate over fields to have all the real constraints *)
-let build_Contains d1 d2 =
-  match d1, d2 with
-  | D_i(i1, t1), D_i(i2, t2) -> (i1, Contains, i2)
-  | D_i(i1, t1), D_field(D_i(i2, t2),f2) -> (i1, Contains, i2 + (get_field_number t2 f2))
-  | D_field(D_i(i1, t1),f1), D_i(i2, t2) -> (i1 + (get_field_number t1 f1), Contains, i2)
-  | D_field(D_i(i1, t1),f1), D_field(D_i(i2, t2),f2) -> (i1 + (get_field_number t1 f1), Contains, i2 + (get_field_number t2 f2))
-  | _ -> assert false
-
-let build_Points_to d1 d2 =
-  match d1, d2 with
-  | D_i(i1,t1), D_addr(D_i(i2,t2)) -> (i1, Points_to, i2)
-  | D_field(D_i(i1,t1),f1), D_addr(D_i(i2,t2)) -> (i1 + (get_field_number t1 f1), Points_to, i2)
-  | _ -> assert false
-
-let build_Contains_star d1 d2 =
-  match d1, d2 with
-  | D_i(i1,t1), D_mem(D_i(i2,t2)) -> (i1, Contains_star, i2)
-  | D_i(i1,t1), D_mem(D_field(D_i(i2,t2),f2)) -> (* TODO: is it really there ? *)
-     (i1, Contains_star, i2 + (get_field_number t2 f2))
-  | D_field(D_i(i1,t1),f1), D_mem(D_i(i2,t2)) -> (i1 + (get_field_number t1 f1), Contains_star, i2)
-  | D_field(D_i(i1,t1),f1), D_mem(D_field(D_i(i2,t2),f2)) -> (* TODO: is it really there ? *)
-     (i1 + (get_field_number t1 f1), Contains_star, i2 + (get_field_number t2 f2))
-  | _ -> assert false
-
+(* We add a typecheck for those constraints where we are to assume
+that the terms are of the same type *)
+let number_all_fields ?(tc=true) t1 t2 =
+  if
+    tc &&
+      (typeSigWithAttrs ~ignoreSign:true (fun al -> al) t1
+       <> typeSigWithAttrs ~ignoreSign:true (fun al -> al) t2)
+  then invalid_arg "number_all_fields: types do not match"
+  else number_sub_fields t1
 
 let unPtrType t =
   match unrollType t with
   | TPtr(u,_) -> u
   | _ -> assert false
 
-let build_Contains_star_k d1 d2 =
-  match d1, d2 with
-  | D_i(i1,t1), D_field(D_mem(D_i(i2,t2)),f2) -> (i1, Contains_star_k(get_field_number (unPtrType t2) f2), i2)
-  | D_i(i1,t1), D_index(i2,k,t2) -> (i1, Contains_star_k(k), i2)
-  | D_field(D_i(i1,t1),f1), D_field(D_mem(D_i(i2,t2)),f2) -> (i1 + (get_field_number t1 f1), Contains_star_k(get_field_number (unPtrType t2) f2), i2)
-  | D_field(D_i(i1,t1),f1), D_index(i2,k,t2) -> (i1 + (get_field_number t1 f1), Contains_star_k(k), i2)
+(* In some cases, field-accessed variables behave like normal
+   variables: this function is there to make the corresponding cases
+   more readable *)
+let reduce_field d =
+  match d with
+  | D_i(_) -> d
+  | D_field(D_i(i,t),f) -> D_i(i + (get_field_number t f), type_of_field t f)
   | _ -> assert false
 
-let build_Contains_k d1 d2 =
-  match d1, d2 with
-  | D_i(i1,t1), D_addr(D_field(D_i(i2,t2),f2)) -> (i1, Contains_k(get_field_number t2 f2), i2)
-  | D_i(i1,t1), D_addr(D_field(D_mem(D_i(i2,t2)),f2)) -> (i1, Contains_k(get_field_number (unPtrType t2) f2), i2)
-  | D_field(D_i(i1,t1),f1), D_addr(D_field(D_i(i2,t2),f2)) -> (i1 + (get_field_number t1 f1), Contains_k(get_field_number t2 f2), i2)
-  | D_field(D_i(i1,t1),f1), D_addr(D_field(D_mem(D_i(i2,t2)),f2)) -> (i1 + (get_field_number t1 f1), Contains_k(get_field_number (unPtrType t2) f2), i2)
+let build_Contains_iteration n i1 i2 =
+  let rec loop acc k =
+    if k <= 0 then (i1, Contains, i2) :: acc
+    else loop ((i1 + k, Contains, i2 + k) :: acc) (k-1)
+  in
+  loop [] (n-1)
+
+let build_Contains d1 d2 =
+  let e1, e2 =
+    match d1, d2 with
+    | (D_i(_) | D_field(D_i(_),_)), (D_i(_) | D_field(D_i(_),_)) -> reduce_field d1, reduce_field d2
+    | _ -> assert false
+  in
+  match e1, e2 with
+  | D_i(i1, t1), D_i(i2, t2) -> build_Contains_iteration (number_all_fields t1 t2) i1 i2
   | _ -> assert false
+
+(* No iteration because, d2 being a pointer, hence of pointer type, d1 can not be of struct type *)
+let build_Points_to d1 d2 =
+  let e1 =
+    match d1 with
+    | D_i(_) | D_field(D_i(_),_) -> reduce_field d1
+    | _ -> assert false
+  in
+  match e1, d2 with
+  | D_i(i1,t1), D_addr(D_i(i2,t2)) -> [ (i1, Points_to, i2) ]
+  | _ -> assert false
+
+
+let build_Contains_star_iteration n i1 i2 =
+  let rec loop acc k =
+    if k <= 0 then (i1, Contains_star_k(0), i2) :: acc
+    else loop ((i1 + k, Contains_star_k(k), i2) :: acc) (k-1)
+  in
+  if n = 1 then [ (i1, Contains_star, i2) ]
+  else loop [] (n-1)
+
+let build_Contains_star d1 d2 =
+  let e1 =
+    match d1 with
+    | D_i(_) | D_field(D_i(_),_) -> reduce_field d1
+    | _ -> assert false
+  in
+  let e2 =
+    match d2 with (* TODO: There is still a small doubt whether D_mem(D_field(...)) should be in this rule or elsewhere *)
+    | D_mem( (D_i(_) | D_field(D_i(_),_)) as x2) -> D_mem(reduce_field x2)
+    | _ -> assert false
+  in
+  match e1, e2 with
+  | D_i(i1,t1), D_mem(D_i(i2,t2)) -> build_Contains_star_iteration (number_all_fields t1 (unPtrType t2)) i1 i2
+  | _ -> assert false
+
+
+let build_Contains_star_k_iteration k n i1 i2 =
+  let rec loop acc j =
+    if j <= 0 then (i1, Contains_star_k(k + 0), i2) :: acc
+    else loop ((i1 + j, Contains_star_k(k + j), i2) :: acc) (j-1)
+  in
+  loop [] (n-1)
+
+
+let build_Contains_star_k d1 d2 =
+  let e1 =
+    match d1 with
+    | D_i(_) | D_field(D_i(_),_) -> reduce_field d1
+    | _ -> assert false
+  in
+  match e1, d2 with
+  | D_i(i1,t1), D_field(D_mem(D_i(i2,t2)),f2) -> build_Contains_star_k_iteration (get_field_number (unPtrType t2) f2) (number_all_fields t1 (type_of_field (unPtrType t2) f2)) i1 i2
+  | D_i(i1,t1), D_index(i2,k,t2) -> build_Contains_star_k_iteration k (number_all_fields t1 t2) i1 i2
+  | _ -> assert false
+
+
+(* No iteration because, d2 being a pointer, hence of pointer type, d1 can not be of struct type *)
+let build_Contains_k d1 d2 =
+  let e1 =
+    match d1 with
+    | D_i(_) | D_field(D_i(_),_) -> reduce_field d1
+    | _ -> assert false
+  in
+  match e1, d2 with
+  | D_i(i1,t1), D_addr(D_field(D_i(i2,t2),f2)) -> [ (i1, Contains_k(get_field_number t2 f2), i2) ] (* TODO: not sure about this one, it is not described in the paper *)
+  | D_i(i1,t1), D_addr(D_field(D_mem(D_i(i2,t2)),f2)) -> [ (i1, Contains_k(get_field_number (unPtrType t2) f2), i2) ]
+  | _ -> assert false
+
+
+let build_Star_contains_iteration n i1 i2 =
+  let rec loop acc k =
+    if k <= 0 then (i1, Star_k_contains(0), i2) :: acc
+    else loop ((i1, Star_k_contains(k), i2 + k) :: acc) (k-1)
+  in
+  if n = 1 then [ (i1, Star_contains, i2) ]
+  else loop [] (n-1)
 
 let build_Star_contains d1 d2 =
-  match d1, d2 with
-  | D_mem(D_i(i1,t1)), D_i(i2,t2) -> (i1, Star_contains, i2)
-  | D_mem(D_field(D_i(i1,t1),f1)), D_i(i2,t2) -> (i1 + (get_field_number t1 f1), Star_contains, i2)
-  | D_mem(D_i(i1,t1)), D_field(D_i(i2,t2),f2) -> (i1, Star_contains, i2 + (get_field_number t2 f2))
-  | D_mem(D_field(D_i(i1,t1),f1)), D_field(D_i(i2,t2),f2) -> (i1 + (get_field_number t1 f1), Star_contains, i2 + (get_field_number t2 f2))
+  let e1 =
+    match d1 with (* TODO: There is still a small doubt whether D_mem(D_field(...)) should be in this rule or elsewhere *)
+    | D_mem( (D_i(_) | D_field(D_i(_),_)) as x1) -> D_mem(reduce_field x1)
+    | _ -> assert false
+  in
+  let e2 =
+    match d2 with
+    | D_i(_) | D_field(D_i(_),_) -> reduce_field d2
+    | _ -> assert false
+  in
+  match e1, e2 with
+  | D_mem(D_i(i1,t1)), D_i(i2,t2) -> build_Star_contains_iteration (number_all_fields (unPtrType t1) t2) i1 i2
   | _ -> assert false
 
+let build_Star_k_contains_iteration k n i1 i2 =
+  let rec loop acc j =
+    if j <= 0 then (i1, Star_k_contains(k + 0), i2)::acc
+    else loop ((i1, Star_k_contains(k + j), i2 + j) :: acc) (j-1)
+  in
+  loop [] (n-1)
+
 let build_Star_k_contains d1 d2 =
-  match d1, d2 with
-  | D_index(i1,k,t1), D_i(i2,t2) -> (i1, Star_k_contains(k), i2)
-  | D_index(i1,k,t1), D_field(D_i(i2,t2),f2) -> (i1, Star_k_contains(k), i2 + (get_field_number t2 f2))
-  | D_field(D_mem(D_i(i1,t1)),f1), D_i(i2,t2) -> (i1, Star_k_contains(get_field_number (unPtrType t1) f1), i2)
-  | D_field(D_mem(D_i(i1,t1)),f1), D_field(D_i(i2,t2),f2) -> (i1, Star_k_contains(get_field_number (unPtrType t1) f1), i2 + (get_field_number t2 f2))
+  let e2 =
+    match d2 with
+    | D_i(_) | D_field(D_i(_),_) -> reduce_field d2
+    | _ -> assert false
+  in
+  match d1, e2 with
+  | D_index(i1,k,t1), D_i(i2,t2) -> build_Star_k_contains_iteration k (number_all_fields t1 t2) i1 i2
+  | D_field(D_mem(D_i(i1,t1)),f1), D_i(i2,t2) -> build_Star_k_contains_iteration (get_field_number (unPtrType t1) f1) (number_all_fields (type_of_field (unPtrType t1) f1) t2) i1 i2
   | _ -> assert false
 
 
@@ -989,8 +1077,12 @@ let graph_of_relationships relationships =
   let add_relationship ct =
     let constraints = get_constraints ct in
     List.iter
-      (fun (i1, c, i2) ->
-        G.add_edge_e g (i1, c, i2)
+      (fun split_constraint ->
+	List.iter
+	  (fun (i1, c, i2) ->
+            G.add_edge_e g (i1, c, i2)
+	  )
+	  split_constraint
       )
       constraints
   in
