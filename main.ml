@@ -5,8 +5,10 @@ let input_file = ref ""
 
 (* TODO: remaining tasks:
   - unions
+  - A few expressions (prolly only Question)
   - initializations
   - heap allocations
+  - Doubts about some constraints
  *)
 
 let set_input_file s =
@@ -132,12 +134,23 @@ let rec number_sub_fields t =
   | TVoid(_) | TInt(_) | TFloat(_) | TPtr(_) | TFun(_) | TEnum(_) | TBuiltin_va_list(_) -> 1
   | TArray(u,_,_) -> number_sub_fields u
   | TComp(ci,_) ->
-     List.fold_left
-       (fun sum fi ->
-	 if fi.fname = missingFieldName then sum
-	 else sum + (number_sub_fields fi.ftype))
-       0
-       ci.cfields
+     if ci.cstruct then
+       List.fold_left
+	 (fun sum fi ->
+	   if fi.fname = missingFieldName then sum
+	   else sum + (number_sub_fields fi.ftype))
+	 0
+	 ci.cfields
+     else
+       List.fold_left
+	 (fun max fi ->
+	   if fi.fname = missingFieldName then assert false
+	   else
+	     let n = number_sub_fields fi.ftype in
+	     if n > max then n else max)
+	 0
+	 ci.cfields
+
 
 let rec get_offset_number typ offset =
   match offset with
@@ -151,8 +164,14 @@ let rec get_offset_number typ offset =
 	    | [] -> raise Not_found
 	    | hd::tl ->
 	       if hd.fname = fi.fname
-	       then acc + (get_offset_number hd.ftype ofs)
-	       else loop (acc + (number_sub_fields hd.ftype)) tl
+	       then
+		 if ci.cstruct
+		 then acc + (get_offset_number hd.ftype ofs)
+		 else get_offset_number hd.ftype ofs
+	       else
+		 if ci.cstruct (* not necessary, but this at least avoids the (acc + ...) calculation in case of union*)
+		 then loop (acc + (number_sub_fields hd.ftype)) tl
+		 else loop acc tl
 	  in
 	  loop 0 ci.cfields
        | _ -> invalid_arg "get_offset_number: not a structure/union"
@@ -176,8 +195,14 @@ let rec get_field_number typ field =
 	  | [] -> raise Not_found
 	  | hd::tl ->
 	     if hd.fname = s
-	     then acc + (get_field_number hd.ftype sub_field)
-	     else loop (acc + (number_sub_fields hd.ftype)) tl
+	     then
+	       if ci.cstruct
+	       then acc + (get_field_number hd.ftype sub_field)
+	       else get_field_number hd.ftype sub_field
+	     else
+	       if ci.cstruct (* not necessary, see similar remark above *)
+	       then loop (acc + (number_sub_fields hd.ftype)) tl
+	       else loop acc tl
 	in
 	loop 0 ci.cfields
      | _ -> invalid_arg "get_offset_field: not a structure/union"
@@ -187,16 +212,42 @@ let prepend_field s = List.map (fun f -> Field(s, f))
 
 let prepend_first_field s field_list = (prepend_field s field_list) @ [ NoField ]
 
+let rec merge_views l1 l2 =
+  match l1, l2 with
+  | [], [] -> []
+  | _::_, [] -> l1
+  | [], _::_ -> l2
+  | hd1::tl1, hd2::tl2 ->
+     (hd1 @ hd2) :: (merge_views tl1 tl2)
+
 (* In case of struct, the list contains an expansion of the struct,
    where each element is a field name and its alternative names
    (e.g. x is also x.f is f is the first field).  In case of nested
    fields there might be more than 1 alternative name, hence the list.
    By construction, we ensure that the first alternative of a name is
    the full (this is why we put [ NoField ] at the end in the
-   prepend_first_field function above *)
+   prepend_first_field function above).
+   In case of a union, the first alternative will be the full name
+   of the first member of the union. *)
 let rec flatten_type t =
   match unrollType t with
-  | TComp(ci,_) -> flatten_fields ci
+  | TComp(ci,_) ->
+     if ci.cstruct
+     then flatten_fields ci
+     else
+       let views = List.map (fun fi -> (fi.fname, flatten_type fi.ftype)) ci.cfields in
+       let prepended_views =
+	 List.map
+	   (fun (s, flattened_fields) ->
+	     List.map (prepend_field s) flattened_fields)
+	   views
+       in
+       let all_merged = List.fold_right merge_views prepended_views [] in
+       begin
+	 match all_merged with
+	 | [] -> []
+	 | hd::tl -> (hd @ [ NoField ]) :: tl
+       end
   | _ -> [ [ NoField ] ]
 and flatten_fields ci =
   let no_missing = List.filter (fun fi -> fi.fname <> missingFieldName) ci.cfields in
@@ -228,7 +279,7 @@ let rec type_of_field typ field =
 	  | hd::tl ->
 	     if hd.fname = s
 	     then type_of_field hd.ftype sub_field
-	     else loop  tl
+	     else loop tl
 	in
 	loop ci.cfields
      | _ -> invalid_arg "type_of_field: not a structure/union"
@@ -887,6 +938,7 @@ let build_Contains d1 d2 =
     | _ -> assert false
   in
   match e1, e2 with
+  (* TODO: solve the problem of arrays assigned with a value b = t[i] *)
   | D_i(i1, t1), D_i(i2, t2) -> build_Contains_iteration (number_all_fields t1 t2) i1 i2
   | _ -> assert false
 
