@@ -901,12 +901,20 @@ let generate_constraints c =
   List.flatten (List.map canonicalize_constraint no_irrelevant)
 
 (* We add a typecheck for those constraints where we are to assume
-that the terms are of the same type *)
+that the terms are of the same type. Let us not forget that array
+types are "shrinked" to the type they contain. *)
 let number_all_fields ?(tc=true) t1 t2 =
+  let u1, u2 =
+    match unrollType t1, unrollType t2 with
+    | TArray(u1,_,_), TArray(u2,_,_) -> t1, t2
+    | TArray(u1,_,_), _ -> u1, t2
+    | _, TArray(u2,_,_) -> t1, u2
+    | _, _ -> t1, t2
+  in
   if
     tc &&
-      (typeSigWithAttrs ~ignoreSign:true (fun al -> al) t1
-       <> typeSigWithAttrs ~ignoreSign:true (fun al -> al) t2)
+      (typeSigWithAttrs ~ignoreSign:true (fun al -> al) u1
+       <> typeSigWithAttrs ~ignoreSign:true (fun al -> al) u2)
   then invalid_arg "number_all_fields: types do not match"
   else number_sub_fields t1
 
