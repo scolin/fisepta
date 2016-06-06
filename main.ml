@@ -6,6 +6,8 @@ let input_file = ref ""
 (* TODO: remaining tasks:
   - A few expressions (prolly only Question)
   - heap allocations
+  - better type comparison
+  - variadic functions
   - Doubts about some constraints
  *)
 
@@ -57,6 +59,75 @@ let update_seenFunctions file =
   let findFunctions = new findFunctionsClass in
   visitCilFile findFunctions file
 
+let (seenStructures: (int, compinfo) Hashtbl.t) = Hashtbl.create 47
+
+class allStructsClass =
+object(self)
+  inherit Cil.nopCilVisitor
+
+  method vtype t =
+    match unrollType t with
+    | TComp(ci,_) ->
+       begin
+	 if ci.cstruct && not (Hashtbl.mem seenStructures ci.ckey) then Hashtbl.add seenStructures ci.ckey ci;
+	 DoChildren
+       end
+    | _ -> DoChildren
+
+end
+
+let update_seenStructures file =
+  let findStructures = new allStructsClass in
+  visitCilFile findStructures file
+
+let heap_type = ref (TVoid([]))
+
+let rec number_sub_fields t =
+  match unrollType t with
+  | TNamed(_) -> assert false
+  | TVoid(_) | TInt(_) | TFloat(_) | TPtr(_) | TFun(_) | TEnum(_) | TBuiltin_va_list(_) -> 1
+  | TArray(u,_,_) -> number_sub_fields u
+  | TComp(ci,_) ->
+     if ci.cstruct then
+       List.fold_left
+	 (fun sum fi ->
+	   if fi.fname = missingFieldName then sum
+	   else sum + (number_sub_fields fi.ftype))
+	 0
+	 ci.cfields
+     else
+       List.fold_left
+	 (fun max fi ->
+	   if fi.fname = missingFieldName then assert false
+	   else
+	     let n = number_sub_fields fi.ftype in
+	     if n > max then n else max)
+	 0
+	 ci.cfields
+
+
+(* The type of all heaps is the union of all the structures in the program *)
+let update_heap_type file =
+  let () = update_seenStructures file in
+  (* sort in reverse, so that the biggest structure appears first *)
+  let compare_cis ci2 ci1 = Pervasives.compare (number_sub_fields (TComp(ci1,[]))) (number_sub_fields (TComp(ci2,[]))) in
+  let sorted_structs = Hashtbl.fold (fun _ ci acc -> List.merge compare_cis [ci] acc) seenStructures [] in
+  let name = "__HEAP_type" in
+  let build_list _ =
+    List.map
+      (fun ci ->
+	(
+	  "field_" ^ ci.cname,
+	  TComp(ci, []),
+	  None,
+	  [],
+	  locUnknown
+	)
+      )
+      sorted_structs
+  in
+  let heap_compinfo = mkCompInfo false name build_list [] in
+  heap_type := TComp(heap_compinfo, [])
 
 
 type var_category =
@@ -65,10 +136,30 @@ type var_category =
   | LocalVar of varinfo * fundec
   | GlobalVar of varinfo
 
+(* We shall consider formal vars the same even if they do not have the
+same name, as long as they are at the same position *)
+let compare_category v1 v2 =
+  match v1, v2 with
+  | FormalVar(s1,i1,vi1), FormalVar(s2,i2,vi2) ->
+     if vi1.vid = vi2.vid then i1 - i2 else vi1.vid - vi2.vid
+  | LocalVar(vi1,_), LocalVar(vi2,_)
+  | GlobalVar(vi1), GlobalVar(vi2) -> vi1.vid - vi2.vid
+  | _, _ -> Pervasives.compare v1 v2
+
+
 type refinfo =
   | RealVariable of var_category
   | TempVariable of varinfo
   | ReturnVar of varinfo (* not a fundec, for functions that have no body *)
+  | HeapSite of location * typ
+
+let compare_refinfo r1 r2 =
+  match r1, r2 with
+  | RealVariable(v1), RealVariable(v2) -> compare_category v1 v2
+  | TempVariable(vi1), TempVariable(vi2) -> vi1.vid - vi2.vid
+  | ReturnVar(vi1), ReturnVar(vi2) -> vi1.vid - vi2.vid
+  | HeapSite(l1,_), HeapSite(l2,_) -> compareLoc l1 l2
+  | _, _ -> Pervasives.compare r1 r2
 
 
 let type_of_refinfo r =
@@ -93,6 +184,7 @@ let type_of_refinfo r =
   | RealVariable(LocalVar(v,f)) -> v.vtype
   | RealVariable(GlobalVar(v)) -> v.vtype
   | TempVariable(v) -> v.vtype
+  | HeapSite(_,t) -> t
   | ReturnVar(f) ->
      match unrollType f.vtype with
      | TFun(rtype,_,_,_) -> rtype
@@ -126,28 +218,6 @@ let get_field_index ci f =
   gfi 0 ci.cfields
 
 
-let rec number_sub_fields t =
-  match unrollType t with
-  | TNamed(_) -> assert false
-  | TVoid(_) | TInt(_) | TFloat(_) | TPtr(_) | TFun(_) | TEnum(_) | TBuiltin_va_list(_) -> 1
-  | TArray(u,_,_) -> number_sub_fields u
-  | TComp(ci,_) ->
-     if ci.cstruct then
-       List.fold_left
-	 (fun sum fi ->
-	   if fi.fname = missingFieldName then sum
-	   else sum + (number_sub_fields fi.ftype))
-	 0
-	 ci.cfields
-     else
-       List.fold_left
-	 (fun max fi ->
-	   if fi.fname = missingFieldName then assert false
-	   else
-	     let n = number_sub_fields fi.ftype in
-	     if n > max then n else max)
-	 0
-	 ci.cfields
 
 
 let rec get_offset_number typ offset =
@@ -295,6 +365,7 @@ let string_of_refinfo r =
   | RealVariable(v) -> string_of_var_category v
   | TempVariable(v) -> v.vname ^ "(temporary)"
   | ReturnVar(f) -> "return of " ^ f.vname
+  | HeapSite(l,_) -> Pretty.sprint ~width:1000 (d_loc () l)
 
 let string_of_fieldable (r,f) =
   (string_of_refinfo r) ^ (string_of_field f)
@@ -304,23 +375,7 @@ module RefinfoCompare =
 struct
   type t = refinfo
 
-  let pair_of r =
-    match r with
-    | RealVariable(v) ->
-       begin
-         match v with
-         | FormalVar(_,i,f) -> (f.vid, i)
-         | LocalVar(vi,_) -> (vi.vid, 0)
-         | GlobalVar(vi) -> (vi.vid, 0)
-       end
-    | TempVariable(v) -> (v.vid, 0)
-    | ReturnVar(v) -> (v.vid, -1)
-
-  let compare r1 r2 =
-    let (x1, y1) = pair_of r1
-    and (x2, y2) = pair_of r2 in
-    let cmp_x = compare x1 x2 in
-    if cmp_x = 0 then compare y1 y2 else cmp_x
+  let compare = compare_refinfo
 
 end
 module RefinfoMap = Map.Make(RefinfoCompare)
@@ -383,7 +438,8 @@ let get_global_field vi f = get_fieldable (RealVariable(GlobalVar(vi)), f)
 let get_global vi = get_global_field vi NoField
 let get_local_field vi fundec f = get_fieldable (RealVariable(LocalVar(vi, fundec)), f)
 let get_local vi fundec = get_local_field vi fundec NoField
-
+let get_heapsite_field l t f = get_fieldable (HeapSite(l,t), f)
+let get_heapsite l t = get_heapsite_field l t NoField
 
 let get_formals_prototype f =
   let formals =
@@ -462,6 +518,7 @@ let id_of r =
   | RealVariable(GlobalVar(v)) -> get_global v
   | TempVariable(v) -> get_temporary v
   | ReturnVar(f) -> get_return f
+  | HeapSite(l,t) -> get_heapsite l t
 
 let end_of i = PureIdMap.find i !end_of
 
@@ -505,6 +562,7 @@ type constraint_origin =
   | CRefExpr of refinfo * (exp * fundec)
   | CLvalExpr of (lval * fundec) * (exp * fundec)
   | CLvalRef of (lval * fundec) * refinfo
+  | CLvalAddrRef of (lval * fundec) * refinfo
   | CFunPtrCall of lval option * exp * exp list * fundec
 
 
@@ -592,7 +650,11 @@ class constraintVisitorClass seenFunctions =
               match lval_opt with
               | None -> ()
               | Some(ret) ->
-                 relationships := (CLvalRef((ret, current_fundec), ReturnVar(vi))) :: !relationships
+		 if vi.vname = "malloc" (* We only support malloc ATM to test things, but this can easily be generalized *)
+		 then
+		   relationships := (CLvalAddrRef((ret, current_fundec), HeapSite(loc, !heap_type))) :: !relationships
+		 else
+                   relationships := (CLvalRef((ret, current_fundec), ReturnVar(vi))) :: !relationships
             in
             let add_parameter called_f i (s, expr) =
               relationships := (CRefExpr( RealVariable(FormalVar(s, i, called_f)), (expr, current_fundec))) :: !relationships
@@ -923,19 +985,14 @@ let generate_constraints c =
 (* We add a typecheck for those constraints where we are to assume
 that the terms are of the same type. Let us not forget that array
 types are "shrinked" to the type they contain. *)
-let number_all_fields ?(tc=true) t1 t2 =
-  let u1, u2 =
-    match unrollType t1, unrollType t2 with
-    | TArray(u1,_,_), TArray(u2,_,_) -> t1, t2
-    | TArray(u1,_,_), _ -> u1, t2
-    | _, TArray(u2,_,_) -> t1, u2
-    | _, _ -> t1, t2
-  in
+let number_all_fields ?(tc=false) t1 t2 =
   if
     tc &&
-      (typeSigWithAttrs ~ignoreSign:true (fun al -> al) u1
-       <> typeSigWithAttrs ~ignoreSign:true (fun al -> al) u2)
-  then invalid_arg "number_all_fields: types do not match"
+      (typeSigWithAttrs ~ignoreSign:true (fun al -> al) t1
+       <> typeSigWithAttrs ~ignoreSign:true (fun al -> al) t2)
+  then invalid_arg ("number_all_fields: types do not match: "
+		    ^ (Pretty.sprint ~width:1000 (d_type () t1)) ^ " vs "
+		    ^ (Pretty.sprint ~width:1000 (d_type () t2)))
   else number_sub_fields t1
 
 let unPtrType t =
@@ -1152,6 +1209,10 @@ let get_constraints ct =
   | CLvalRef((l,f), r) ->
      let c_left = build_dereferencing_lval f l in
      let c_right = D_i(id_of r, type_of_refinfo r) in
+     build_constraints (c_left, c_right)
+  | CLvalAddrRef((l,f), r) ->
+     let c_left = build_dereferencing_lval f l in
+     let c_right = D_addr(D_i(id_of r, type_of_refinfo r)) in
      build_constraints (c_left, c_right)
   | CFunPtrCall(lval_opt, exp, exps, f) ->
      let (funptr_i, simplif_constraints) =
@@ -1440,6 +1501,7 @@ let _ =
     else (Arg.usage spec_args usage_msg; exit 1)
   in
   let () = update_seenFunctions maincil in
+  let () = update_heap_type maincil in
   let constraintVisitor = new constraintVisitorClass seenFunctions in
   let () = visitCilFile (constraintVisitor:>cilVisitor) maincil in
   let relationships = constraintVisitor#return_relationships in
