@@ -4,9 +4,7 @@ open Pretty
 let input_file = ref ""
 
 (* TODO: remaining tasks:
-  - unions
   - A few expressions (prolly only Question)
-  - initializations
   - heap allocations
   - Doubts about some constraints
  *)
@@ -509,12 +507,34 @@ type constraint_origin =
   | CLvalRef of (lval * fundec) * refinfo
   | CFunPtrCall of lval option * exp * exp list * fundec
 
-(* TODO: also visit initializations *)
+
 class constraintVisitorClass seenFunctions =
   object(self)
   inherit Cil.nopCilVisitor
 
   val relationships = ref []
+
+  method vinit vi ofs init =
+    match !currentGlobal with
+    | GFun(f,_) -> (* We are initializing a static/const variable *)
+       begin
+	 match init with
+	 | SingleInit e ->
+	    begin
+	      relationships := (CLvalExpr((addOffsetLval ofs (Var(vi), NoOffset), f), (e, f))) :: !relationships;
+	      SkipChildren
+	    end
+	 | CompoundInit(_) -> DoChildren
+       end
+    | _ -> (* We are in a global variable initialization *)
+       match init with
+       | SingleInit e ->
+	  begin
+	    relationships := (CLvalExpr((addOffsetLval ofs (Var(vi), NoOffset), dummyFunDec), (e, dummyFunDec))) :: !relationships;
+	    SkipChildren
+	  end
+       | CompoundInit(_) -> DoChildren
+
 
 
   method vstmt s =
