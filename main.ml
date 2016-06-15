@@ -26,6 +26,8 @@ let fatal s = prerr_endline ("[fatal] " ^ s)
 
 (**************************************************************************************************)
 
+let string_of_typ t = Pretty.sprint ~width:1000 (d_type () t)
+
 
 let (seenFunctions: (string, fundec) Hashtbl.t) = Hashtbl.create 1009
 
@@ -82,6 +84,90 @@ let update_seenStructures file =
 
 let heap_type = ref (TVoid([]))
 
+let (variadic_fields : (int, int) Hashtbl.t) = Hashtbl.create 47
+
+let init_union_type vi t =
+  let name = "variadic_" ^ vi.vname in
+  let () = Hashtbl.add variadic_fields vi.vid 1 in
+  let build_list _ =
+    [ (name ^ "_field_0",
+       t,
+       None,
+       [],
+       locUnknown
+    ) ]
+  in
+  let init_ci = mkCompInfo false name build_list [] in
+  TComp(init_ci, [])
+
+let structunion_has_type su t =
+  let tsig_t = typeSigWithAttrs ~ignoreSign:true (fun al -> al) t in
+  let rec aux_has_type rest =
+    match rest with
+    | [] -> false
+    | hd::tl ->
+       let tsig_hd = typeSigWithAttrs ~ignoreSign:true (fun al -> al) hd.ftype in
+       if tsig_t = tsig_hd then true
+       else aux_has_type tl
+  in
+  aux_has_type su.cfields
+
+let (knownMaxVariadicTypes: (int, typ) Hashtbl.t) = Hashtbl.create 47
+
+let embiggen_union_type vi t =
+  let () = info ("Adding variadic type info " ^ (string_of_typ t) ^ " to " ^ vi.vname) in
+  try
+    let typ = Hashtbl.find knownMaxVariadicTypes vi.vid in
+    match unrollType typ with
+    | TComp(ci,a) ->
+       if not (structunion_has_type ci t)
+       then
+	 begin
+	   try
+	     let n = Hashtbl.find variadic_fields vi.vid in
+	     let () = Hashtbl.replace variadic_fields vi.vid (n+1) in
+	     let new_field =
+	       { fcomp = ci;
+		 ftype = t;
+		 fname = "variadic_" ^ vi.vname ^ "_field_" ^ (string_of_int n);
+		 fbitfield = None;
+		 fattr = [];
+		 floc = locUnknown } in
+	     ci.cfields <- new_field :: ci.cfields
+					  (* TODO: is replacing a mutable field in a hash-ref'ed value all that clean ? *)
+	   with Not_found -> assert false
+	 end
+    (* else the type is already present, no need to add it *)
+    | _ -> assert false
+  with
+    Not_found -> Hashtbl.add knownMaxVariadicTypes vi.vid (init_union_type vi t)
+
+class variadicTypesVisitor =
+object(self)
+  inherit Cil.nopCilVisitor
+
+  method vinst i =
+    match i with
+    | Call(_, Lval(Var(vi), NoOffset), [_; SizeOf va_arg_typ; _] , _) when vi.vname = "__builtin_va_arg" ->
+       let current_fundec =
+	 match !currentGlobal with
+	 | GFun(f,_) -> f
+	 | _ -> assert false
+       in
+       begin
+	 embiggen_union_type current_fundec.svar va_arg_typ;
+	 SkipChildren
+       end
+    | Call(_, Lval(Var(vi), NoOffset), _ , _) when vi.vname = "__builtin_va_arg" -> assert false
+    | _ -> SkipChildren
+
+end
+
+let update_known_variadic_types file =
+  let variadicVisitor = new variadicTypesVisitor in
+  visitCilFile variadicVisitor file
+
+
 let rec number_sub_fields t =
   match unrollType t with
   | TNamed(_) -> assert false
@@ -130,6 +216,17 @@ let update_heap_type file =
   heap_type := TComp(heap_compinfo, [])
 
 
+let args_of f =
+  match unrollType f.vtype with
+  | TFun(_,args,_,_) -> List.map (fun (s,_,_) -> s) (argsToList args)
+  | _ -> invalid_arg ("args_of: " ^ f.vname)
+
+let is_variadic f =
+   match unrollType f.vtype with
+  | TFun(_,_,isva,_) -> isva
+  | _ -> invalid_arg ("is_variadic: " ^ f.vname)
+
+
 type var_category =
   (* x, place of x among the formals, f (as a varinfo in case f is an extern function *)
   | FormalVar of string * int * varinfo
@@ -175,7 +272,10 @@ let type_of_refinfo r =
               t
             with
               Failure _ ->
-                invalid_arg ("type_of_refinfo: not enough arguments in " ^ f.vname)
+	      if is_variadic f
+	      then
+		try Hashtbl.find knownMaxVariadicTypes f.vid with Not_found -> !heap_type
+	      else invalid_arg ("type_of_refinfo: not enough arguments in " ^ f.vname)
             | Invalid_argument _ ->
                invalid_arg ("type_of_refinfo: negative argument in " ^ f.vname)
           end
@@ -370,6 +470,16 @@ let string_of_refinfo r =
 let string_of_fieldable (r,f) =
   (string_of_refinfo r) ^ (string_of_field f)
 
+let compute_variadic_ref f =
+  match unrollType f.vtype with
+  | TFun(_,sta_l_opt,isva,_) ->
+     if isva
+     then
+       let n = List.length (argsToList sta_l_opt) in
+       RealVariable(FormalVar("variadic_" ^ f.vname, n, f))
+     else invalid_arg ("compute_variadic: " ^ f.vname ^ " is not a variadic function")
+  | _ -> invalid_arg ("compute_variadic: " ^ f.vname ^ " is not a function")
+
 
 module RefinfoCompare =
 struct
@@ -404,110 +514,113 @@ let of_ids = ref PureIdMap.empty
 let end_of = ref PureIdMap.empty
 
 
+let add_to_ids last i x =
+  begin
+    info ("Found a referenceable: " ^ (string_of_fieldable x) ^ "[" ^ (string_of_int i) ^ "]" ^ "(end: " ^ (string_of_int last) ^ ")");
+    ids_of := FieldableMap.add x i !ids_of
+  end
+
+let add_entry r last field_and_altnames =
+  let i = !uid and () = incr uid in
+  match field_and_altnames with
+  | [] -> assert false
+  | full_name :: _ ->
+     begin
+       end_of := PureIdMap.add i last !end_of;
+       of_ids := PureIdMap.add i (r,full_name) !of_ids;
+       List.iter (add_to_ids last i) (List.map (fun field -> (r,field)) field_and_altnames)
+     end
+
+
+let build_formals_prototype f =
+  let formals =
+    match unrollType f.vtype with
+    | TFun(_,args_opt, isva,_) ->
+       let args = List.map (fun (s,t,_) -> (s,t)) (argsToList args_opt) in
+       if isva
+       then
+	 let variadic_type =
+	   try Hashtbl.find knownMaxVariadicTypes f.vid with Not_found -> !heap_type
+	 in
+	 let variadic_name = "variadic_" ^ f.vname in
+	 args @ [ (variadic_name, variadic_type) ]
+       else args
+    | _ -> invalid_arg ("build_formals_prototype: " ^ f.vname ^ " is not a function")
+  in
+  let total = List.length formals in
+  let lengths = List.map (fun (s,t) -> number_sub_fields t) formals in
+  let total_length = List.fold_left (+) 0 lengths in
+  let end_formals = !uid + total_length - 1 in
+  let rec add_formals n sub_n names_types =
+    match names_types with
+    | [] -> assert (total = n && total_length = sub_n)
+    | (name, typ)::tl ->
+       let r = RealVariable(FormalVar(name, n, f)) in (* thus the variadic part will be mapped to the last parameter as a "real" variable *)
+       let flattened_type = flatten_type typ in
+       let size = List.length flattened_type in
+       let () = List.iter (add_entry r end_formals) flattened_type in
+       add_formals (n+1) (sub_n + size) tl
+  in
+  let () = add_formals 0 0 formals in
+  let add_return () =
+    let r = ReturnVar(f) in
+    let flattened_type = flatten_type (type_of_refinfo r) in
+    let size = List.length flattened_type in
+    let last = !uid + size - 1 in
+    List.iter (add_entry r last) flattened_type
+  in
+  add_return ()
+
+
+(* Beware, this function does not check if FormalVar(s,i,v) makes
+sense (i.e. that i corresponds to at most the last argument of
+function v (which is the last effective argument or the variadic part,
+if v is a variadic function *)
 let get_fieldable (r, f) =
   try
     FieldableMap.find (r,f) !ids_of
   with
     Not_found ->
-    let flattened_type = flatten_type (type_of_refinfo r) in
-    let size = List.length flattened_type in
-    let last = !uid + size - 1 in
-    let add_to_ids i x =
-      begin
-	info ("Found a referenceable: " ^ (string_of_fieldable x) ^ "[" ^ (string_of_int i) ^ "]" ^ "(end: " ^ (string_of_int last) ^ ")");
-	ids_of := FieldableMap.add x i !ids_of
-      end
-    in
-    let add_f field_and_altnames =
-      let i = !uid and () = incr uid in
-      match field_and_altnames with
-      | [] -> assert false
-      | full_name :: _ ->
-	 begin
-	   end_of := PureIdMap.add i last !end_of;
-	   of_ids := PureIdMap.add i (r,full_name) !of_ids;
-	   List.iter (add_to_ids i) (List.map (fun field -> (r,field)) field_and_altnames)
-	 end
-    in
-    let () = List.iter add_f flattened_type in
-    FieldableMap.find (r,f) !ids_of
+    match r with
+    | RealVariable(FormalVar(s,i,v)) -> (build_formals_prototype v; FieldableMap.find (r,f) !ids_of)
+    | ReturnVar(g) -> (build_formals_prototype g;  FieldableMap.find (r,f) !ids_of)
+    | _ ->
+       let flattened_type = flatten_type (type_of_refinfo r) in
+       let size = List.length flattened_type in
+       let last = !uid + size - 1 in
+       let () = List.iter (add_entry r last) flattened_type in
+       FieldableMap.find (r,f) !ids_of
+
 
 let get_temporary_field v f = get_fieldable (TempVariable(v), f)
 let get_temporary v = get_temporary_field v NoField
 let get_global_field vi f = get_fieldable (RealVariable(GlobalVar(vi)), f)
 let get_global vi = get_global_field vi NoField
+let get_formal_field f i field =
+  let (args, isva) =
+    match f.vtype with
+    | TFun(_,sta_l_opt,isva,_) -> argsToList sta_l_opt, isva
+    | _ -> invalid_arg ("get_formal_field: " ^ f.vname ^ " is not a function")
+  in
+  let (j, s) =
+    try
+      i, (fun (s,_,_) -> s) (List.nth args i)
+    with
+    | Failure "nth" ->
+       if isva then (List.length args), "variadic_" ^ f.vname (* any additional parameter maps to the variadic part *)
+       else invalid_arg "get_formal_field: parameter number too big"
+    | Invalid_argument "List.nth" -> invalid_arg "get_formal_field: negative-numbered parameter"
+  in
+  get_fieldable (RealVariable(FormalVar(s,j,f)), field)
+let get_formal f i =  get_formal_field f i NoField
+
+let get_return_field f field = get_fieldable (ReturnVar(f), field)
+let get_return f = get_return_field f NoField
 let get_local_field vi fundec f = get_fieldable (RealVariable(LocalVar(vi, fundec)), f)
 let get_local vi fundec = get_local_field vi fundec NoField
 let get_heapsite_field l t f = get_fieldable (HeapSite(l,t), f)
 let get_heapsite l t = get_heapsite_field l t NoField
 
-let get_formals_prototype f =
-  let formals =
-    match unrollType f.vtype with
-    | TFun(_,args_opt,_,_) ->
-       List.map (fun (s,_,_) -> s) (argsToList args_opt)
-    | _ -> invalid_arg ("get_formals_prototype: " ^ f.vname ^ " is not a function")
-  in
-  let total = List.length formals in
-  let end_formals = !uid + total - 1 in
-  let rec add_formals already_found n names acc =
-    match names with
-    | [] ->
-       begin
-         assert (total = n);
-         (already_found, acc)
-       end
-    | name::tl ->
-       let r = RealVariable(FormalVar(name, n, f)) in
-       let x = (r, NoField) in
-       try
-         let i = FieldableMap.find x !ids_of in
-         add_formals (already_found + 1) (n+1) tl (i :: acc)
-       with
-         Not_found ->
-           let i = !uid and () = incr uid in
-           begin
-             ids_of := FieldableMap.add x i !ids_of;
-	     end_of := PureIdMap.add i end_formals !end_of;
-             info ("Found a referenceable: " ^ (string_of_refinfo r) ^ "[" ^ (string_of_int i) ^ "]" ^ "(end: " ^ (string_of_int end_formals) ^ ")");
-             of_ids := PureIdMap.add i x !of_ids;
-             add_formals already_found (n+1) tl (i :: acc)
-           end
-  in
-  let (already_found, rev_ids) = add_formals 0 0 formals [] in
-  let add_return already_found acc =
-    let r = ReturnVar(f) in
-    let x = (r, NoField) in
-    try
-      let i = FieldableMap.find x !ids_of in
-      (already_found + 1, i :: acc)
-    with
-      Not_found ->
-        let i = !uid and () = incr uid in
-        let () = info ("Found a referenceable: " ^ (string_of_refinfo r) ^ "[" ^ (string_of_int i) ^ "]") in
-        begin
-          ids_of := FieldableMap.add x i !ids_of;
-	  end_of := PureIdMap.add i i !end_of;
-          of_ids := PureIdMap.add i x !of_ids;
-          (already_found, i :: acc)
-        end
-  in
-  let (already_present, rev_list_of_ids) = add_return already_found rev_ids in
-  if already_present = 0 || already_present = total + 1
-  then List.rev rev_list_of_ids
-  else failwith ("get_formals_prototype: partial presence for function " ^ f.vname)
-
-
-let get_formal f i =
-  let all_formals_plus_return = get_formals_prototype f in
-  let n = List.length all_formals_plus_return in
-  if i < n - 1
-  then List.nth all_formals_plus_return i
-  else invalid_arg ("get_formal: taking parameter " ^ (string_of_int i) ^ " out of " ^ (string_of_int n) ^ " (return included)")
-
-let get_return f =
-  let all_formals_plus_return = get_formals_prototype f in
-  List.hd (List.rev all_formals_plus_return)
 
 
 
@@ -541,11 +654,6 @@ let pLoc l =
   ++ text (string_of_int l.line)
 
 let string_of_loc l = Pretty.sprint ~width:70 (pLoc l)
-
-let args_of f =
-  match unrollType f.vtype with
-  | TFun(_,args,_,_) -> List.map (fun (s,_,_) -> s) (argsToList args)
-  | _ -> invalid_arg ("args_of: " ^ f.vname)
 
 let string_of_args f = String.concat "," (args_of f)
 
@@ -648,7 +756,19 @@ class constraintVisitorClass seenFunctions =
          | Lval(Var(vi), NoOffset) -> (* direct call *)
             let () =
               match lval_opt with
-              | None -> ()
+              | None ->
+		 if vi.vname = "__builtin_va_arg"
+		 then begin
+		     match exprs with
+		     | [_; _; adest] -> (* va_arg is transformed into a 3-argument call. We need to get the return value from the 3rd argument *)
+			begin
+			  match stripCasts adest with
+			  | AddrOf ret ->
+			     relationships := (CLvalRef((ret, current_fundec), compute_variadic_ref current_fundec.svar)) :: !relationships
+			  | _ -> ()
+			end
+		     | _ -> ()
+		   end
               | Some(ret) ->
 		 if vi.vname = "malloc" (* We only support malloc ATM to test things, but this can easily be generalized *)
 		 then
@@ -656,20 +776,27 @@ class constraintVisitorClass seenFunctions =
 		 else
                    relationships := (CLvalRef((ret, current_fundec), ReturnVar(vi))) :: !relationships
             in
-            let add_parameter called_f i (s, expr) =
-              relationships := (CRefExpr( RealVariable(FormalVar(s, i, called_f)), (expr, current_fundec))) :: !relationships
-            in
-            let () =
-              try
-                let combined = List.combine (args_of vi) exprs in
-                List.iteri (add_parameter vi) combined
-              with
-                Invalid_argument _ ->
-                  fatal ("Not the same number of args for " ^ vi.vname ^ " at "
-                         ^ (string_of_loc loc) ^ ": "
-                         ^ (string_of_args vi) ^ " vs "
-                         ^ (string_of_exprs exprs))
-            in
+	    let rec add_parameters variadic called_f i args exprs =
+	      match args, exprs with
+	      | [], [] -> ()
+	      | [], expr::etl ->
+		 if variadic
+		 then
+		   begin
+		     relationships := (CRefExpr( RealVariable(FormalVar("variadic_" ^ called_f.vname, i, called_f)), (expr, current_fundec))) :: !relationships;
+		     add_parameters variadic called_f i [] etl
+		   end
+		 else fatal ((string_of_loc loc) ^ ": " ^ "function called with too many parameters (" ^ vi.vname ^ " is not variadic)")
+	      | arg::atl, [] ->
+		 warn ((string_of_loc loc) ^ ": " ^ "function " ^ vi.vname ^ " called with too few parameters ("
+		       ^ (string_of_int i) ^ "-th parameter " ^ arg ^ " and following can not be assigned an expression")
+	      | arg::atl, expr::etl ->
+		 begin
+		   relationships := (CRefExpr( RealVariable(FormalVar(arg, i, called_f)), (expr, current_fundec))) :: !relationships;
+		   add_parameters variadic called_f (i+1) atl etl
+		 end
+	    in
+	    let () = add_parameters (is_variadic vi) vi 0 (args_of vi) exprs in
             SkipChildren
 	 | _ ->
 	    begin
@@ -1502,6 +1629,7 @@ let _ =
   in
   let () = update_seenFunctions maincil in
   let () = update_heap_type maincil in
+  let () = update_known_variadic_types maincil in
   let constraintVisitor = new constraintVisitorClass seenFunctions in
   let () = visitCilFile (constraintVisitor:>cilVisitor) maincil in
   let relationships = constraintVisitor#return_relationships in
