@@ -5,9 +5,7 @@ let input_file = ref ""
 
 (* TODO: remaining tasks:
   - A few expressions (prolly only Question)
-  - heap allocations
   - better type comparison
-  - variadic functions
   - Doubts about some constraints
  *)
 
