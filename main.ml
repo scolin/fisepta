@@ -1,13 +1,13 @@
 open Cil
 open Pretty
 
-let input_file = ref ""
-
 (* TODO: remaining tasks:
   - A few expressions (prolly only Question)
   - better type comparison
   - Doubts about some constraints
  *)
+
+let input_file = ref ""
 
 let set_input_file s =
   input_file := s
@@ -21,8 +21,6 @@ let error s = prerr_endline ("[error] " ^ s)
 let fatal s = prerr_endline ("[fatal] " ^ s)
 
 
-
-(**************************************************************************************************)
 
 let string_of_typ t = Pretty.sprint ~width:1000 (d_type () t)
 
@@ -113,7 +111,7 @@ let structunion_has_type su t =
 let (knownMaxVariadicTypes: (int, typ) Hashtbl.t) = Hashtbl.create 47
 
 let embiggen_union_type vi t =
-  let () = info ("Adding variadic type info " ^ (string_of_typ t) ^ " to " ^ vi.vname) in
+  let () = debug ("Adding variadic type info " ^ (string_of_typ t) ^ " to " ^ vi.vname) in
   try
     let typ = Hashtbl.find knownMaxVariadicTypes vi.vid in
     match unrollType typ with
@@ -454,8 +452,10 @@ let rec type_of_field typ field =
 
 let string_of_var_category v =
   match v with
-  | FormalVar(s,i,v) -> s ^ "(arg " ^ (string_of_int i) ^ " of " ^ v.vname ^ ")"
-  | LocalVar(v,f) -> v.vname ^ "(local of " ^ f.svar.vname ^ ")"
+  | FormalVar(s,i,v) ->
+     let t = if s = "" then v.vname ^ "_(" ^ (string_of_int i) ^ ")" else s in
+     t ^ (if !do_debug then " (arg " ^ (string_of_int i) ^ " of " ^ v.vname ^ ")" else "")
+  | LocalVar(v,f) -> v.vname ^ (if !do_debug then "(local of " ^ f.svar.vname ^ ")" else "")
   | GlobalVar(v) -> v.vname
 
 let string_of_refinfo r =
@@ -514,7 +514,9 @@ let end_of = ref PureIdMap.empty
 
 let add_to_ids last i x =
   begin
-    info ("Found a referenceable: " ^ (string_of_fieldable x) ^ "[" ^ (string_of_int i) ^ "]" ^ "(end: " ^ (string_of_int last) ^ ")");
+    info ("Found a referenceable: " ^ (string_of_fieldable x) ^
+	    (if !do_debug then ("[" ^ (string_of_int i) ^ "]" ^ "(end: " ^ (string_of_int last) ^ ")")
+	     else ""));
     ids_of := FieldableMap.add x i !ids_of
   end
 
@@ -784,7 +786,7 @@ class constraintVisitorClass seenFunctions =
 		     relationships := (CRefExpr( RealVariable(FormalVar("variadic_" ^ called_f.vname, i, called_f)), (expr, current_fundec))) :: !relationships;
 		     add_parameters variadic called_f i [] etl
 		   end
-		 else fatal ((string_of_loc loc) ^ ": " ^ "function called with too many parameters (" ^ vi.vname ^ " is not variadic)")
+		 else error ((string_of_loc loc) ^ ": " ^ "function called with too many parameters (" ^ vi.vname ^ " is not variadic)")
 	      | arg::atl, [] ->
 		 warn ((string_of_loc loc) ^ ": " ^ "function " ^ vi.vname ^ " called with too few parameters ("
 		       ^ (string_of_int i) ^ "-th parameter " ^ arg ^ " and following can not be assigned an expression")
@@ -817,7 +819,7 @@ module Vertex = struct
 end
 
 let s_of_vertex n =
-  string_of_fieldable (of_id n) ^ "[" ^ (string_of_int n) ^ "]"
+  string_of_fieldable (of_id n) ^ (if !do_debug then "[" ^ (string_of_int n) ^ "]" else "")
 
 type edge_constraint =
   | Contains
@@ -1002,7 +1004,7 @@ let simplify_dereferencing d =
      let i = D_i(idx, type_of_x) in
      let d' = D_field(i, f) in
      let ((d1, d2) as assign) = (i, x) in
-     let () = info (
+     let () = debug (
        "Transforming " ^ (string_of_dereferencing d)
        ^ " into " ^ (string_of_dereferencing d')
        ^ " with " ^ (string_of_constraint assign))
@@ -1017,7 +1019,7 @@ let simplify_dereferencing d =
      let i = D_i(idx, type_of_x) in
      let d' = D_mem(i) in
      let ((d1, d2) as assign) = (i, x) in
-     let () = info (
+     let () = debug (
        "Transforming " ^ (string_of_dereferencing d)
        ^ " into " ^ (string_of_dereferencing d')
        ^ " with " ^ (string_of_constraint assign))
@@ -1093,7 +1095,7 @@ let canonicalize_constraint ((d1, d2) as c) =
      let i = D_i(idx, type_of_d2) in
      let c1 = (d1, i) in
      let c2 = (i, d2) in
-     let () = info (
+     let () = debug (
        "Transforming " ^ (string_of_constraint c)
        ^ " into " ^ (string_of_constraint c1)
        ^ " and " ^ (string_of_constraint c2))
@@ -1392,7 +1394,7 @@ let graph_of_relationships relationships =
 
 
 let rule_trans witness g p =
-  let rule_prefix = "rule_trans " ^ (string_of_int p) in
+  let rule_prefix = "rule_trans " ^ (if !do_debug then (string_of_int p) else "") in
   let all_preds = G.pred g p in
   let all_succs = G.succ g p in
   let all_rs = List.filter (fun r -> G.mem_edge_e g (r, Contains, p)) all_preds in
@@ -1603,7 +1605,7 @@ let compute_constraints g =
 
 
 let usage_msg =
-  ( "usage : " ^ (Filename.basename Sys.executable_name) ^ " file.cil\n" )
+  ( "Usage : " ^ (Filename.basename Sys.executable_name) ^ " file.cil\n" )
 
 let spec_args = [
     "-debug", Arg.Set do_debug, "Print more detailed information" ]
