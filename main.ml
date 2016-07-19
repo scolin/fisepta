@@ -918,8 +918,13 @@ let rec build_dereferencing_expr f expr =
   | SizeOfStr(_)
   | AlignOf(_)
   | AlignOfE(_)
-  | UnOp(_)
-  | BinOp(_) -> D_irrelevant(typeOf expr) (*TODO *)
+  | UnOp(_) -> D_irrelevant(typeOf expr) (*TODO *)
+  | BinOp(binop, e, _, _) ->
+     begin
+       match binop with
+       | PlusPI | IndexPI | MinusPI -> build_dereferencing_expr f e
+       | _ -> D_irrelevant(typeOf expr)
+     end
   | Question(_) -> (*TODO *) D_irrelevant(typeOf expr)
   | CastE(_,e) -> build_dereferencing_expr f e
   | AddrOfLabel(_) -> D_irrelevant(typeOf expr)
