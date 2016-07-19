@@ -1,0 +1,86 @@
+Trucs à prendre en compte:
+- affectations de structures
+- variadiques
+
+Structures à savoir prendre en compte:
+x                          -> D_i
+f(...,x,...) et return(x)  -> D_index
+x.f                        -> D_field(D_i)
+x->f et (*x).f             -> D_field(D_mem(D_i))
+*x                         -> D_mem(D_i)
+*(x.f)                     -> D_mem(D_field(D_i))
+&x                         -> D_addr(D_i)
+&(x.f)=&x.f                -> D_addr(D_field(D_i))
+&p->f = &((*p).f)          -> D_addr(D_field(D_mem(D_i)))
+Et compositions plus complexes
+
+Contraintes à savoir prendre en compte:
+p > q          p = q (p.f = q, p = q.g, p.f = q.g)
+p > {q}        p = &q (p.f = &q)
+p > *q         p = *q (p.f = *q, p = *(q.g), p.f = *(q.g))
+*p > q         *p = q (*(p.f) = q, *p = q.g, *(p.f) = q.g)
+p > *(q+k)     p = *q(...) avec return le k-ième paramètre, p.f = *q(...)
+               p = q->k, p.f = q->k
+*(p+k) > q     *p(...,q,...)^, *p(...,q.g,...)
+               p->k = q, p->k = q.g
+p > q+k        p = &(q->k), p = &q.g
+               p.f = &(q->k), p.f = &q.g
+
+Règles à savoir prendre en compte:
+trans:   p > {q} & r > p                                           -> r > {q}
+deref1:  p > *q & q > {r}                                          -> p > r
+deref2:  *p > q & p > {r}                                          -> r > q
+deref4:  p > *(q+k) & q > {r} & idx(s) = idx(r)+k & idx(s)<=end(r) -> p > s
+deref5:  *(p+k) > q & p > {r} & idx(s) = idx(r)+k & idx(s)<=end(r) -> s > q
+add:     p > q+k & q > {r} & idx(s) = idx(r)+k & idx(s)<=end(r)    -> p > {s}
+
+Suggestions de forme pour les tests:
+trans:
+  int q;
+  int *p, *r;
+  p = &q;
+  r = p;
+Attendu: r > {q}
+
+deref1:
+  int a;
+  int *r, *p;
+  int **q;
+  r = &a;
+  q = &r;
+  p = *q;
+Attendu: p > r
+
+deref2:
+   int a;
+   int *q, *r;
+   int **p;
+   q = &a;
+   p = &r;
+   *p = q;
+Attendu: r > q
+
+deref4:
+  int a;
+  struct { int i, int j, int *k} r, *q;
+  int *p;
+  r.k = &a;
+  q = &r
+  p = q->k;
+Attendu: p > r.k (et p > {a})
+
+deref5:
+  int a;
+  struct { int i, int j, int *k} *q, r;
+  int *q;
+  r.k = &a;
+  p = &r;
+  p->k = q;
+Attendu: r.k > q
+
+add:
+  struct { int i, int j, int *k} *q, r;
+  int *p;
+  q = &r;
+  p = &q->k;
+Attendu: p > {r.k}

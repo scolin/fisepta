@@ -1,0 +1,45 @@
+D_irrelevant := _ : []
+_ := D_irrelevant : []
+D_i := D_i : x = y
+D_i := D_field : x = y.f
+D_i := D_index : x = return(f) (seul cas possible)
+D_i := D_addr : x = &y
+D_i := D_mem : x = *y
+D_field := D_i : x.f = y
+D_field := D_field : x.f = y.g
+D_field := D_index : x.f = return(f) (seul cas possible)
+D_field := D_addr : x.f = &y
+D_field := D_mem : x.f = *y
+D_index := D_i : f(x)
+D_index := D_field : f(x.f)
+D_index := D_index : f(return(g)) (pas sur que ce soit possible)
+D_index := D_addr : f(&x)
+D_index := D_mem : f(*x)
+D_addr := _ : []
+D_mem := D_i : *x = y
+D_mem := D_field : *x = y.f
+D_mem := D_index : *x = return(f)
+D_mem := D_addr : *x = &y
+D_mem := D_mem : *x = *y
+
+Dans le papier:
+b = &record : b :> {record.first_field}
+b->f2 = &c:
+  t = &c    : t :> {c}
+  b->f2 = t
+    (*b).f2 = t : *(b+1) :> t
+p = b->f2:
+  p = (*b).f2 : p :> *(b+1)
+q = &(p->f2) :
+  q = &((*p).f2) : q :> &(*(p+1))
+
+q = &(b.f2) : q :> {b.f2} ?
+
+conjecture:
+a = b.f2 : a :> eval(b+1) ?
+
+record = truc:
+  record.f1 = truc.f1 ou *(truc+0)
+  voire
+  record.f1 = truc.f1
+  record.f2 = truc.f2
