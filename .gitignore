@@ -1,0 +1,6 @@
+.gitignore
+*.cmi
+*.cmx
+*.cmo
+*.o
+*.exe

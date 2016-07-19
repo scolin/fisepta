@@ -1,0 +1,34 @@
+
+This project is an attempt at implementing a field-sensitive pointer
+analysis for C using the CIL library.
+
+This analysis is described in the paper "Efficient field-sensitive pointer
+analysis of C" by David J. Pearce, Paul H.J. Kelly and Chris Hankin:
+
+@article{Pearce:2007:EFP:1290520.1290524,
+ author = {Pearce, David J. and Kelly, Paul H.J. and Hankin, Chris},
+ title = {Efficient Field-sensitive Pointer Analysis of C},
+ journal = {ACM Trans. Program. Lang. Syst.},
+ issue_date = {November 2007},
+ volume = {30},
+ number = {1},
+ month = nov,
+ year = {2007},
+ issn = {0164-0925},
+ articleno = {4},
+ url = {http://doi.acm.org/10.1145/1290520.1290524},
+ doi = {10.1145/1290520.1290524},
+ acmid = {1290524},
+ publisher = {ACM},
+ address = {New York, NY, USA},
+ keywords = {Set-constraints, pointer analysis},
+} 
+
+The implementation here differs mostly in the set-constraint analysis:
+constraints are represented through a graph (with different kinds of edge
+depending on the constraint) represented with OCamlGraph and propagated by
+analysing each vertex of the graph.
+
+As such, the implementation is not geared toward efficiency: the first fact
+of the matter was the implementability of the approach in CIL.
+
