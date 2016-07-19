@@ -911,35 +911,39 @@ let rec is_irrelevant = function
 
 let rec build_dereferencing_expr f expr =
   match expr with
-  | Const(const) -> D_irrelevant(typeOf expr)
+  | Const(const) -> [ D_irrelevant(typeOf expr) ]
   | Lval(lval) -> build_dereferencing_lval f lval
   | SizeOf(_)
   | SizeOfE(_)
   | SizeOfStr(_)
   | AlignOf(_)
   | AlignOfE(_)
-  | UnOp(_) -> D_irrelevant(typeOf expr) (*TODO *)
+  | UnOp(_) -> [ D_irrelevant(typeOf expr) ]
   | BinOp(binop, e, _, _) ->
      begin
        match binop with
        | PlusPI | IndexPI | MinusPI -> build_dereferencing_expr f e
-       | _ -> D_irrelevant(typeOf expr)
+       | _ -> [ D_irrelevant(typeOf expr) ]
      end
-  | Question(_) -> (*TODO *) D_irrelevant(typeOf expr)
+  | Question(_,e1,e2,_) -> (* [ D_irrelevant(typeOf expr) ] *)
+     (build_dereferencing_expr f e1) @ (build_dereferencing_expr f e2)
   | CastE(_,e) -> build_dereferencing_expr f e
-  | AddrOfLabel(_) -> D_irrelevant(typeOf expr)
+  | AddrOfLabel(_) -> [ D_irrelevant(typeOf expr) ]
   | AddrOf(lval)
-  | StartOf(lval) -> D_addr(build_dereferencing_lval f lval)
+  | StartOf(lval) -> List.map (fun x -> D_addr(x)) (build_dereferencing_lval f lval)
 and build_dereferencing_lval f (lhost, offset) =
   let field = build_dereferencing_offset offset in
-  let deref_lhost = build_dereferencing_lhost f lhost in
-  let lhost_type = type_of_dereferencing deref_lhost in
+  let derefs_lhost = build_dereferencing_lhost f lhost in
   match field with
-  | NoField -> deref_lhost
+  | NoField -> derefs_lhost
   | _ ->
-     match unrollType lhost_type with
-     | TComp(_) -> D_field(deref_lhost, field)
-     | _ -> assert false
+     List.map
+       (fun deref_lhost ->
+	 let lhost_type = type_of_dereferencing deref_lhost in
+	 match unrollType lhost_type with
+	 | TComp(_) -> D_field(deref_lhost, field)
+	 | _ -> assert false)
+       derefs_lhost
 and build_dereferencing_offset offset =
   match offset with
   | NoOffset -> NoField
@@ -965,8 +969,8 @@ and build_dereferencing_lhost f lhost =
             with
               Not_found -> RealVariable(LocalVar(vi, f))
      in
-     D_i(id_of refinfo, vi.vtype)
-  | Mem(expr) -> D_mem(build_dereferencing_expr f expr)
+     [ D_i(id_of refinfo, vi.vtype) ]
+  | Mem(expr) -> List.map (fun x -> D_mem(x)) (build_dereferencing_expr f expr)
 
 
 let build_dereferencing_refinfo r = D_i(id_of r, type_of_refinfo r)
@@ -1332,27 +1336,42 @@ let get_constraints ct =
   match ct with
   | CRefExpr(r, (e,f)) ->
      let c_left = D_i(id_of r, type_of_refinfo r) in
-     let c_right = build_dereferencing_expr f e in
-     build_constraints (c_left, c_right)
+     let c_rights = build_dereferencing_expr f e in
+     List.flatten
+       (List.map (fun c_right -> build_constraints (c_left, c_right)) c_rights)
   | CLvalExpr((l,f1), (e,f2)) ->
-     let c_left = build_dereferencing_lval f1 l in
-     let c_right = build_dereferencing_expr f2 e in
-     build_constraints (c_left, c_right)
+     let c_lefts = build_dereferencing_lval f1 l in
+     let c_rights = build_dereferencing_expr f2 e in
+     List.flatten
+       (List.map
+	  (fun c_left ->
+	    List.flatten
+	      (List.map (fun c_right -> build_constraints (c_left, c_right)) c_rights)
+	  )
+	  c_lefts)
   | CLvalRef((l,f), r) ->
-     let c_left = build_dereferencing_lval f l in
+     let c_lefts = build_dereferencing_lval f l in
      let c_right = D_i(id_of r, type_of_refinfo r) in
-     build_constraints (c_left, c_right)
+     List.flatten
+       (List.map
+	  (fun c_left ->
+	    build_constraints (c_left, c_right))
+	  c_lefts)
   | CLvalAddrRef((l,f), r) ->
-     let c_left = build_dereferencing_lval f l in
+     let c_lefts = build_dereferencing_lval f l in
      let c_right = D_addr(D_i(id_of r, type_of_refinfo r)) in
-     build_constraints (c_left, c_right)
+     List.flatten
+       (List.map
+	  (fun c_left ->
+	    build_constraints (c_left, c_right))
+	  c_lefts)
   | CFunPtrCall(lval_opt, exp, exps, f) ->
      let (funptr_i, simplif_constraints) =
        match exp with
        | Lval(Mem(Lval(Var(vi), NoOffset)), NoOffset) ->
           let d_i =
             match build_dereferencing_lhost f (Var(vi)) with
-            | D_i(i,_) -> i
+            | [ D_i(i,_) ] -> i
             | _ -> assert false
           in
           (d_i, [])
@@ -1362,20 +1381,27 @@ let get_constraints ct =
           let () = tmp_var.vname <- "tmp_funptr_" ^ (string_of_int tmp_var.vid) in
           let idx = get_temporary tmp_var in
           let c_left = D_i(idx, type_of_complex) in
-          let c_right = build_dereferencing_expr f complex in
-          let new_constraints = build_constraints (c_left, c_right) in
+          let c_rights = build_dereferencing_expr f complex in
+          let new_constraints = List.flatten (List.map (fun c_right -> build_constraints (c_left, c_right)) c_rights) in
           (idx, new_constraints)
        | _ -> assert false (* All calls to function pointers should at least be of the Lval(Mem(...),...) shape *)
      in
      let build_constraint_param k expr =
-       build_constraints ((D_index(funptr_i, k, typeOf expr)), (build_dereferencing_expr f expr))
+       List.flatten
+	 (List.map
+	    (fun c_right ->
+	      build_constraints (D_index(funptr_i, k, typeOf expr), c_right))
+	    (build_dereferencing_expr f expr))
      in
      let each_param_constraints = List.mapi build_constraint_param exps in
      let return_constraint =
        match lval_opt with
        | None -> []
        | Some(lval) ->
-          build_constraints ((build_dereferencing_lval f lval), (D_index(funptr_i, List.length exps, typeOfLval lval)))
+	  List.flatten
+	    (List.map
+	       (fun c_left -> build_constraints (c_left, (D_index(funptr_i, List.length exps, typeOfLval lval))))
+	       (build_dereferencing_lval f lval))
      in
     List.concat (return_constraint :: simplif_constraints :: each_param_constraints)
 
